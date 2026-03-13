@@ -534,6 +534,7 @@ impl WgpuEngine {
                     }
                 }
                 Command::Dispatch(shader_id, wg_size, bindings) => {
+                    log::info!("KJSL: shader dispatch {:?}", wg_size);
                     let (x, y, z) = *wg_size;
                     // println!("dispatching {:?} with {} bindings", wg_size, bindings.len());
                     let shader = &self.shaders[shader_id.0];
