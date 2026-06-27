@@ -18,6 +18,7 @@ use vello_common::coarse::{Cmd, MODE_CPU, Wide, WideTile};
 use vello_common::color::palette::css::BLACK;
 use vello_common::fearless_simd::Level;
 use vello_common::flatten::{FlattenCtx, Line};
+use vello_common::geometry::RectU16;
 use vello_common::kurbo::{Affine, BezPath, Cap, Join, Stroke, StrokeCtx};
 use vello_common::peniko::Fill;
 use vello_common::strip::Strip;
@@ -32,7 +33,7 @@ fn main() {
         Document::new().set("viewBox", (-10, -10, args.width + 20, args.height + 20));
 
     let mut line_buf = vec![];
-    let mut tiles = Tiles::new(Level::new());
+    let mut tiles = Tiles::new(Level::new(), args.height);
     let mut strip_buf = vec![];
     let mut alpha_buf = vec![];
     let mut wide = Wide::<MODE_CPU>::new(args.width, args.height);
@@ -49,6 +50,7 @@ fn main() {
                 Affine::IDENTITY,
                 &mut line_buf,
                 &mut FlattenCtx::default(),
+                RectU16::new(0, 0, args.width, args.height),
             );
         } else {
             let stroke = Stroke {
@@ -66,12 +68,13 @@ fn main() {
                 &mut line_buf,
                 &mut FlattenCtx::default(),
                 &mut StrokeCtx::default(),
+                RectU16::new(0, 0, args.width, args.height),
             );
         }
     }
 
     if stages.iter().any(|s| s.requires_tiling()) {
-        tiles.make_tiles(&line_buf, args.width, args.height);
+        tiles.make_tiles_analytic_aa(Level::new(), &line_buf, args.width, args.height);
         tiles.sort_tiles();
     }
 
@@ -93,6 +96,8 @@ fn main() {
             BLACK.into(),
             BlendMode::new(Mix::Normal, Compose::SrcOver),
             0,
+            None,
+            &[],
         );
     }
 
@@ -309,7 +314,9 @@ fn draw_wide_tiles(document: &mut Document, wide_tiles: &[WideTile], alphas: &[u
                 Cmd::AlphaFill(s) => {
                     for x in 0..s.width {
                         for y in 0..Tile::HEIGHT {
-                            let alpha = alphas[s.alpha_idx
+                            // Since we only draw one path, we can use alpha offset
+                            // directly, since the absolute offset is 0.
+                            let alpha = alphas[s.alpha_offset as usize
                                 + usize::from(x) * usize::from(Tile::HEIGHT)
                                 + usize::from(y)];
 

@@ -4,13 +4,22 @@
 //! Tests for basic functionality.
 
 use crate::renderer::Renderer;
-use crate::util::{circular_star, crossed_line_star, miter_stroke_2};
+use crate::util::{
+    circular_star, crossed_line_star, layout_glyphs_roboto, miter_stroke_2, stops_green_blue,
+};
 use std::f64::consts::PI;
+use vello_common::coarse::Cmd;
 use vello_common::color::palette::css::{
     BEIGE, BLUE, DARK_BLUE, GREEN, LIME, MAROON, REBECCA_PURPLE, RED, TRANSPARENT,
 };
 use vello_common::kurbo::{Affine, BezPath, Circle, Join, Point, Rect, Shape, Stroke};
-use vello_common::peniko::Fill;
+use vello_common::peniko::{Fill, Gradient};
+use vello_cpu::color::palette::css::BLACK;
+use vello_cpu::peniko::LinearGradientPosition;
+use vello_cpu::{
+    CompositeMode, Glyph, Level, Pixmap, RasterizerSettings, RenderContext, RenderMode,
+    RenderSettings,
+};
 use vello_dev_macros::vello_test;
 
 #[vello_test(width = 8, height = 8)]
@@ -119,7 +128,7 @@ fn stroked_circle(ctx: &mut impl Renderer) {
     ctx.stroke_path(&circle.to_path(0.1));
 }
 
-/// Requires winding of the first row of tiles to be calculcated correctly for vertical lines.
+/// Requires winding of the first row of tiles to be calculated correctly for vertical lines.
 #[vello_test(width = 10, height = 10)]
 fn rectangle_above_viewport(ctx: &mut impl Renderer) {
     let rect = Rect::new(2.0, -5.0, 8.0, 8.0);
@@ -128,7 +137,7 @@ fn rectangle_above_viewport(ctx: &mut impl Renderer) {
     ctx.fill_rect(&rect);
 }
 
-/// Requires winding of the first row of tiles to be calculcated correctly for sloped lines.
+/// Requires winding of the first row of tiles to be calculated correctly for sloped lines.
 #[vello_test(width = 10, height = 10)]
 fn triangle_above_and_wider_than_viewport(ctx: &mut impl Renderer) {
     let path = {
@@ -145,7 +154,7 @@ fn triangle_above_and_wider_than_viewport(ctx: &mut impl Renderer) {
     ctx.fill_path(&path);
 }
 
-/// Requires winding and pixel coverage to be calculcated correctly for tiles preceding the
+/// Requires winding and pixel coverage to be calculated correctly for tiles preceding the
 /// viewport in scan direction.
 #[vello_test(width = 10, height = 10)]
 fn rectangle_left_of_viewport(ctx: &mut impl Renderer) {
@@ -177,6 +186,44 @@ fn filled_aligned_rect(ctx: &mut impl Renderer) {
     let rect = Rect::new(1.0, 1.0, 29.0, 19.0);
 
     ctx.set_paint(REBECCA_PURPLE.with_alpha(0.5));
+    ctx.fill_rect(&rect);
+}
+
+#[vello_test(width = 100, height = 100)]
+fn filled_inverted_rect(ctx: &mut impl Renderer) {
+    let rect = Rect::new(80.0, 80.0, 20.0, 20.0);
+
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_rect(&rect);
+}
+
+#[vello_test(width = 100, height = 100)]
+fn filled_inverted_rect_gradient(ctx: &mut impl Renderer) {
+    // Gradient paint should not be affected by the rect inversion.
+    let rect = Rect::new(80.0, 80.0, 20.0, 20.0);
+    let gradient = Gradient {
+        kind: LinearGradientPosition {
+            start: Point::new(20.0, 20.0),
+            end: Point::new(80.0, 20.0),
+        }
+        .into(),
+        stops: stops_green_blue(),
+        ..Default::default()
+    };
+
+    ctx.set_paint(gradient);
+    ctx.fill_rect(&rect);
+}
+
+#[vello_test(width = 100, height = 100)]
+fn filled_inverted_rect_rotated(ctx: &mut impl Renderer) {
+    let rect = Rect::new(80.0, 80.0, 20.0, 20.0);
+
+    ctx.set_transform(Affine::rotate_about(
+        45.0 * PI / 180.0,
+        Point::new(50.0, 50.0),
+    ));
+    ctx.set_paint(REBECCA_PURPLE);
     ctx.fill_rect(&rect);
 }
 
@@ -301,6 +348,14 @@ fn filled_transformed_rect_4(ctx: &mut impl Renderer) {
     ));
     ctx.set_paint(REBECCA_PURPLE.with_alpha(0.5));
     ctx.fill_rect(&rect);
+}
+
+#[vello_test(width = 100, height = 100)]
+fn blurred_rounded_rect_inverted(ctx: &mut impl Renderer) {
+    let rect = Rect::new(80.0, 80.0, 20.0, 20.0);
+
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_blurred_rounded_rect(&rect, 10.0, 2.0, false);
 }
 
 #[vello_test(width = 30, height = 30)]
@@ -433,4 +488,295 @@ fn stroke_scaled(ctx: &mut impl Renderer) {
     ctx.set_stroke(stroke);
     ctx.set_paint(LIME);
     ctx.stroke_path(&path);
+}
+
+// Subpaths without an explicit `MoveTo` after a `ClosePath` should start at the initial point of
+// the previous subpath, and unclosed subpaths should get correctly closed.
+#[vello_test(width = 30, height = 30)]
+fn implicit_subpaths(ctx: &mut impl Renderer) {
+    let mut path = BezPath::new();
+
+    path.move_to((15., 5.));
+    path.line_to((25., 5.));
+    path.line_to((25., 15.));
+    path.close_path();
+
+    // Second subpath: again starts at (10., 10.), as it doesn't have an initial `MoveTo`. We don't
+    // close it, instead we move to a new point. It should get automatically closed.
+    path.line_to((15., 15.));
+    path.line_to((5., 15.));
+
+    // Third subpath: it's closed implicitly.
+    path.move_to((5., 18.));
+    path.line_to((25., 18.));
+    path.line_to((25., 28.));
+
+    ctx.set_paint(LIME);
+    ctx.fill_path(&path);
+}
+
+// Just so we can more closely observe changes in their size.
+// We have this test here instead of in `vello_common` because
+// the vello_common tests seemingly are not run for 32-bit in CI.
+#[vello_test(no_ref)]
+fn test_cmd_size(_: &mut impl Renderer) {
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(
+        size_of::<Cmd>(),
+        16,
+        "size of a command didn't match the expected value"
+    );
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(
+        size_of::<Cmd>(),
+        16,
+        "size of a command didn't match the expected value"
+    );
+}
+
+/// Test compositing a single glyph to a specific region of a larger spritesheet pixmap using `vello_cpu`.
+///
+/// This demonstrates the glyph caching workflow:
+/// 1. Create a small `RenderContext` sized for a single glyph
+/// 2. Render the glyph into that context
+/// 3. Render it with `CompositeMode::SrcOver` and an offset into a larger spritesheet
+#[test]
+fn render_src_over_with_offset() {
+    let settings = RenderSettings {
+        level: Level::try_detect().unwrap_or(Level::baseline()),
+        num_threads: 0,
+    };
+    let rasterizer_settings = RasterizerSettings {
+        render_mode: RenderMode::OptimizeQuality,
+        ..Default::default()
+    };
+    let spritesheet_width: u16 = 100;
+    let spritesheet_height: u16 = 100;
+    let mut spritesheet = Pixmap::new(spritesheet_width, spritesheet_height);
+
+    // Layout a single character to get glyph metrics
+    let font_size: f32 = 50.0;
+    let (font, glyphs) = layout_glyphs_roboto("B", font_size);
+    let glyph = &glyphs[0];
+
+    // For simplicity, use a fixed glyph size
+    let max_glyph_size: u16 = 55;
+    // Create a small `RenderContext` sized for the glyph
+    let mut glyph_renderer = RenderContext::new_with(max_glyph_size, max_glyph_size, settings);
+    let mut glyph_resources = vello_cpu::Resources::new();
+
+    glyph_renderer.set_transform(Affine::translate((0.0, f64::from(font_size))));
+    glyph_renderer.set_paint(BLACK);
+    glyph_renderer
+        .glyph_run(&mut glyph_resources, &font)
+        .font_size(font_size)
+        .hint(true)
+        .fill_glyphs(std::iter::once(Glyph {
+            id: glyph.id,
+            x: 0.0,
+            y: 0.0,
+        }));
+    glyph_renderer.flush();
+
+    // Positions where we'll blit the glyph
+    let positions: [(u16, u16); 3] = [(15, 15), (30, 30), (0, 0)];
+
+    for (dst_x, dst_y) in positions {
+        glyph_renderer.render_with(
+            &mut spritesheet,
+            &mut glyph_resources,
+            RasterizerSettings {
+                render_mode: RenderMode::OptimizeQuality,
+                composite_mode: CompositeMode::SrcOver,
+                offset: (dst_x, dst_y),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Now render the glyphs directly at the same positions to a reference pixmap
+    // to verify that the glyphs are rendered correctly at the same positions.
+    let mut reference_renderer =
+        RenderContext::new_with(spritesheet_width, spritesheet_height, settings);
+    let mut reference_resources = vello_cpu::Resources::new();
+    reference_renderer.set_paint(BLACK);
+
+    for (dst_x, dst_y) in positions {
+        // The glyph in glyph_renderer was rendered at (0, font_size).
+        // When blitted to (dst_x, dst_y), it appears at (dst_x + 0, dst_y + font_size).
+        // So we need to render at transform (dst_x, dst_y + font_size) in the reference.
+        reference_renderer.set_transform(Affine::translate((
+            f64::from(dst_x),
+            f64::from(dst_y) + f64::from(font_size),
+        )));
+        reference_renderer
+            .glyph_run(&mut reference_resources, &font)
+            .font_size(font_size)
+            .hint(true)
+            .fill_glyphs(std::iter::once(Glyph {
+                id: glyph.id,
+                x: 0.0,
+                y: 0.0,
+            }));
+    }
+    reference_renderer.flush();
+
+    let mut reference_pixmap = Pixmap::new(spritesheet_width, spritesheet_height);
+    reference_renderer.render_with(
+        &mut reference_pixmap,
+        &mut reference_resources,
+        rasterizer_settings,
+    );
+
+    // Uncomment to save the spritesheet as PNG for visual inspection
+    // let diffs_path =
+    //     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vello_sparse_tests/diffs");
+    // let _ = std::fs::create_dir_all(&diffs_path);
+    // let png_data = spritesheet.clone().into_png().unwrap();
+    // std::fs::write(diffs_path.join("render_src_over_with_offset.png"), png_data).unwrap();
+
+    // Compare the two pixmaps
+    assert_eq!(
+        spritesheet.data_as_u8_slice(),
+        reference_pixmap.data_as_u8_slice(),
+        "render result should match direct rendering"
+    );
+}
+
+#[vello_test(width = 30, height = 60)]
+fn left_cull_fully_left_combined(ctx: &mut impl Renderer) {
+    ctx.set_paint(REBECCA_PURPLE);
+
+    let rect_top = Rect::new(-40.0, -10.0, -10.0, 20.0);
+    ctx.set_transform(Affine::rotate_about(
+        15.0 * PI / 180.0,
+        Point::new(-25.0, 5.0),
+    ));
+    ctx.fill_rect(&rect_top);
+
+    let rect_bot = Rect::new(-40.0, 40.0, -10.0, 70.0);
+    ctx.set_transform(Affine::rotate_about(
+        -15.0 * PI / 180.0,
+        Point::new(-25.0, 55.0),
+    ));
+    ctx.fill_rect(&rect_bot);
+}
+
+#[vello_test(width = 30, height = 100)]
+fn left_cull_cross_left_combined(ctx: &mut impl Renderer) {
+    ctx.set_paint(REBECCA_PURPLE);
+
+    let rect_top = Rect::new(-15.0, -15.0, 15.0, 15.0);
+    ctx.set_transform(Affine::rotate_about(
+        10.0 * PI / 180.0,
+        Point::new(0.0, 0.0),
+    ));
+    ctx.fill_rect(&rect_top);
+
+    let rect_mid = Rect::new(-20.0, 35.0, 20.0, 55.0);
+    ctx.set_transform(Affine::rotate_about(
+        5.0 * PI / 180.0,
+        Point::new(0.0, 45.0),
+    ));
+    ctx.fill_rect(&rect_mid);
+
+    let rect_bot = Rect::new(-15.0, 75.0, 15.0, 105.0);
+    ctx.set_transform(Affine::rotate_about(
+        -10.0 * PI / 180.0,
+        Point::new(0.0, 90.0),
+    ));
+    ctx.fill_rect(&rect_bot);
+}
+
+#[vello_test(width = 30, height = 60)]
+fn left_cull_triangle_expands_below_viewport(ctx: &mut impl Renderer) {
+    let mut path = BezPath::new();
+    path.move_to((15.0, 2.0));
+    path.line_to((52.0, 72.0));
+    path.line_to((-22.0, 72.0));
+    path.close_path();
+
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_path(&path);
+}
+
+#[vello_test(width = 30, height = 30)]
+fn left_cull_encloses_viewport(ctx: &mut impl Renderer) {
+    let rect = Rect::new(-50.0, -50.0, 80.0, 80.0);
+
+    ctx.set_transform(Affine::rotate_about(
+        7.0 * PI / 180.0,
+        Point::new(15.0, 15.0),
+    ));
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_rect(&rect);
+}
+
+#[vello_test(width = 30, height = 100)]
+fn left_cull_mask_cross_combined(ctx: &mut impl Renderer) {
+    let transform = Affine::new([0.9848077, 0.17364818, -0.17364818, 0.9848077, 0.0, 0.0]);
+    let rect_path = Rect::new(0.0, 0.0, 30.0, 100.0).to_path(0.1);
+
+    let mut clip_path = BezPath::new();
+    clip_path.move_to((0.0, 100.0));
+    clip_path.line_to((30.0, 100.0));
+    clip_path.line_to((30.0, 0.0));
+    clip_path.line_to((0.0, 0.0));
+    clip_path.close_path();
+
+    let mut mask_clip = BezPath::new();
+
+    mask_clip.move_to((-10.0, -10.0));
+    mask_clip.line_to((15.0, -10.0));
+    mask_clip.line_to((20.0, 25.0));
+    mask_clip.line_to((-15.0, 25.0));
+    mask_clip.close_path();
+
+    mask_clip.move_to((-2.4334785, 31.524632));
+    mask_clip.line_to((12.338636, 34.129355));
+    mask_clip.line_to((6.0873017, 69.58243));
+    mask_clip.line_to((-8.6848135, 66.97771));
+    mask_clip.close_path();
+
+    mask_clip.move_to((-15.0, 75.0));
+    mask_clip.line_to((20.0, 75.0));
+    mask_clip.line_to((15.0, 115.0));
+    mask_clip.line_to((-10.0, 115.0));
+    mask_clip.close_path();
+
+    ctx.push_clip_path(&clip_path);
+    ctx.push_clip_path(&mask_clip);
+    ctx.set_paint(GREEN);
+    ctx.set_transform(transform);
+    ctx.fill_path(&rect_path);
+    ctx.pop_clip_path();
+    ctx.pop_clip_path();
+}
+
+#[vello_test(width = 30, height = 30)]
+fn left_cull_mask_encloses_viewport(ctx: &mut impl Renderer) {
+    let transform = Affine::new([0.9848077, 0.17364818, -0.17364818, 0.9848077, 0.0, 0.0]);
+    let rect_path = Rect::new(-20.0, -20.0, 50.0, 50.0).to_path(0.1);
+
+    let mut clip_path = BezPath::new();
+    clip_path.move_to((0.0, 30.0));
+    clip_path.line_to((30.0, 30.0));
+    clip_path.line_to((30.0, 0.0));
+    clip_path.line_to((0.0, 0.0));
+    clip_path.close_path();
+
+    let mut mask_clip = BezPath::new();
+    mask_clip.move_to((-40.0, -40.0));
+    mask_clip.line_to((70.0, -40.0));
+    mask_clip.line_to((70.0, 70.0));
+    mask_clip.line_to((-40.0, 70.0));
+    mask_clip.close_path();
+
+    ctx.push_clip_path(&clip_path);
+    ctx.push_clip_path(&mask_clip);
+    ctx.set_paint(GREEN);
+    ctx.set_transform(transform);
+    ctx.fill_path(&rect_path);
+    ctx.pop_clip_path();
+    ctx.pop_clip_path();
 }

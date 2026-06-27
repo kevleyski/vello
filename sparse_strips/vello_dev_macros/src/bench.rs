@@ -38,12 +38,12 @@ pub(crate) fn vello_bench_inner(_: TokenStream, item: TokenStream) -> TokenStrea
             }
 
             fn run_integer<S: Simd>(b: &mut Bencher, simd: S) {
-                let mut fine = Fine::<S, U8Kernel>::new(simd);
+                let mut fine = Fine::<S, U8Kernel>::new(simd, WideTile::WIDTH);
                 #inner_fn_name(b, &mut fine);
             }
 
             fn run_float<S: Simd>(b: &mut Bencher, simd: S) {
-                let mut fine = Fine::<S, F32Kernel>::new(simd);
+                let mut fine = Fine::<S, F32Kernel>::new(simd, WideTile::WIDTH);
                 #inner_fn_name(b, &mut fine);
             }
 
@@ -59,16 +59,45 @@ pub(crate) fn vello_bench_inner(_: TokenStream, item: TokenStream) -> TokenStrea
                 });
             }
 
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if let Some(sse4_2) = Level::new().as_sse4_2() {
+                c.bench_function(&get_bench_name(&#input_fn_name_str, "u8_sse4_2"), |b| {
+                    run_integer(b, sse4_2);
+                });
+            }
+
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if let Some(avx2) = Level::new().as_avx2() {
+                c.bench_function(&get_bench_name(&#input_fn_name_str, "u8_avx2"), |b| {
+                    run_integer(b, avx2);
+                });
+            }
+
             // Uncomment this to enable f32_scalar benchmarks.
             // c.bench_function(&get_bench_name(&#input_fn_name_str, "f32_scalar"), |b| {
             //     run_float(b, vello_common::fearless_simd::Fallback::new());
             // });
 
-            // Uncomment this to enable f32_neon benchmarks.
+            // f32 benchmarks are disabled because they are only of secondary importance and take a long time
+            //
             // #[cfg(target_arch = "aarch64")]
             // if let Some(neon) = Level::new().as_neon() {
             //     c.bench_function(&get_bench_name(&#input_fn_name_str, "f32_neon"), |b| {
             //         run_float(b, neon);
+            //     });
+            // }
+
+            // #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // if let Some(sse4_2) = Level::new().as_sse4_2() {
+            //     c.bench_function(&get_bench_name(&#input_fn_name_str, "f32_sse4_2"), |b| {
+            //         run_float(b, sse4_2);
+            //     });
+            // }
+
+            // #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // if let Some(avx2) = Level::new().as_avx2() {
+            //     c.bench_function(&get_bench_name(&#input_fn_name_str, "f32_avx2"), |b| {
+            //         run_float(b, avx2);
             //     });
             // }
         }

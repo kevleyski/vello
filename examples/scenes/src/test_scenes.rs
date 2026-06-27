@@ -31,7 +31,7 @@ pub fn test_scenes() -> SceneSet {
 
 /// A macro which exports each passed scene indivudally
 ///
-/// This is used to avoid having to repetetively define both a function for
+/// This is used to avoid having to repetitively define both a function for
 /// each test scene, and adding them to an enumeration.
 /// Format is `fn $scene_name([arguments to scene!])`.
 /// See the branches of `scene!` for full details.
@@ -109,7 +109,10 @@ export_scenes!(
     fn mmark(crate::mmark::MMark::new(80_000), "mmark", false)
     fn many_draw_objects(many_draw_objects)
     fn blurred_rounded_rect(blurred_rounded_rect)
-    fn image_sampling(image_sampling)
+    fn image_sampling(impls::image_sampling(), "image_sampling", false)
+    fn image_sampling_bicubic(impls::image_sampling_bicubic(), "image_sampling_bicubic", false)
+    fn image_atlas_residency_demo(image_atlas_residency_demo: animated)
+    fn image_atlas_large_residency_demo(image_atlas_large_residency_demo: animated)
     fn image_extend_modes_bilinear(impls::image_extend_modes(ImageQuality::Medium), "image_extend_modes (bilinear)", false)
     fn image_extend_modes_nearest_neighbor(impls::image_extend_modes(ImageQuality::Low), "image_extend_modes (nearest neighbor)", false)
     fn luminance_mask(luminance_mask)
@@ -120,7 +123,7 @@ export_scenes!(
 /// In a module because the exported [`ExampleScene`] creation functions use the same names.
 mod impls {
     use std::f64::consts::{FRAC_1_SQRT_2, PI};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use crate::SceneParams;
     use kurbo::RoundedRect;
@@ -134,6 +137,137 @@ mod impls {
     use vello::*;
 
     const FLOWER_IMAGE: &[u8] = include_bytes!("../../assets/splash-flower.jpg");
+
+    fn sample_image_data() -> ImageData {
+        let mut blob: Vec<u8> = Vec::new();
+        [
+            palette::css::RED,
+            palette::css::BLUE,
+            palette::css::CYAN,
+            palette::css::MAGENTA,
+        ]
+        .iter()
+        .for_each(|c| {
+            blob.extend(c.to_rgba8().to_u8_array());
+        });
+        let data = Blob::new(Arc::new(blob));
+        ImageData {
+            data,
+            format: ImageFormat::Rgba8,
+            width: 2,
+            height: 2,
+            alpha_type: ImageAlphaType::Alpha,
+        }
+    }
+
+    fn sample_bicubic_image_data() -> ImageData {
+        let mut blob: Vec<u8> = Vec::with_capacity(16 * 16 * 4);
+        for y in 0..16 {
+            for x in 0..16 {
+                let is_checker = ((x / 2) + (y / 2)) % 2 == 0;
+                let mut color = if is_checker {
+                    palette::css::BLACK
+                } else {
+                    palette::css::WHITE
+                };
+                if x == 8 || y == 8 {
+                    color = palette::css::RED;
+                }
+                if x == y || x + y == 15 {
+                    color = palette::css::BLUE;
+                }
+                if (x == 2 && y == 13) || (x == 13 && y == 2) {
+                    color = palette::css::LIME;
+                }
+                blob.extend(color.to_rgba8().to_u8_array());
+            }
+        }
+        let data = Blob::new(Arc::new(blob));
+        ImageData {
+            data,
+            format: ImageFormat::Rgba8,
+            width: 16,
+            height: 16,
+            alpha_type: ImageAlphaType::Alpha,
+        }
+    }
+
+    fn make_pattern_image(seed: u8, width: u32, height: u32, cell: u32) -> ImageData {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let checker = ((x / cell) + (y / cell) + seed as u32).is_multiple_of(2);
+                let diagonal = ((x + y + seed as u32 * 7) % 19) < 4;
+                let cx = (width / 2) as i32;
+                let cy = (height / 2) as i32;
+                let radius = (width.min(height) / 4) as i32;
+                let ring = ((x as i32 - cx).pow(2) + (y as i32 - cy).pow(2)) < radius.pow(2);
+                let [r, g, b, a] = if diagonal {
+                    [
+                        240,
+                        48_u8.saturating_add(seed.saturating_mul(12)),
+                        32_u8.saturating_add(seed.saturating_mul(20)),
+                        255,
+                    ]
+                } else if ring {
+                    [
+                        32_u8.saturating_add(seed.saturating_mul(20)),
+                        120_u8.saturating_add(seed.saturating_mul(24)),
+                        255_u8.saturating_sub(seed.saturating_mul(16)),
+                        220,
+                    ]
+                } else if checker {
+                    [16, 16, 24_u8.saturating_add(seed.saturating_mul(12)), 255]
+                } else {
+                    [
+                        240_u8.saturating_sub(seed.saturating_mul(20)),
+                        240,
+                        248,
+                        255,
+                    ]
+                };
+                data.extend([r, g, b, a]);
+            }
+        }
+        ImageData {
+            data: Blob::new(Arc::new(data)),
+            format: ImageFormat::Rgba8,
+            width,
+            height,
+            alpha_type: ImageAlphaType::Alpha,
+        }
+    }
+
+    fn make_residency_demo_image(seed: u8) -> ImageData {
+        make_pattern_image(seed, 96, 96, 12)
+    }
+
+    fn residency_demo_images() -> &'static [ImageData] {
+        static IMAGES: OnceLock<Vec<ImageData>> = OnceLock::new();
+        IMAGES
+            .get_or_init(|| {
+                vec![
+                    make_residency_demo_image(1),
+                    make_residency_demo_image(5),
+                    make_residency_demo_image(9),
+                ]
+            })
+            .as_slice()
+    }
+
+    fn large_residency_demo_images() -> &'static [ImageData] {
+        static IMAGES: OnceLock<Vec<ImageData>> = OnceLock::new();
+        IMAGES
+            .get_or_init(|| {
+                vec![
+                    make_pattern_image(2, 2048, 2048, 96),
+                    make_pattern_image(4, 2048, 2048, 128),
+                    make_pattern_image(6, 2048, 2048, 160),
+                    make_pattern_image(8, 2048, 2048, 192),
+                ]
+            })
+            .as_slice()
+    }
 
     pub(super) fn emoji(scene: &mut Scene, params: &mut SceneParams<'_>) {
         let text_size = 120. + 20. * (params.time * 2.).sin() as f32;
@@ -730,6 +864,7 @@ mod impls {
             Affine::translate((110.0, 700.0)),
             // Add a skew to simulate an oblique font.
             Some(Affine::skew(20_f64.to_radians().tan(), 0.0)),
+            None,
             &Stroke::new(1.0),
             s,
         );
@@ -744,6 +879,7 @@ mod impls {
             palette::css::WHITE,
             Affine::translate((110.0, 800.0)),
             // Add a skew to simulate an oblique font.
+            None,
             None,
             Fill::NonZero,
             "And some Vello\ntext with a newline",
@@ -769,7 +905,7 @@ mod impls {
             &rect,
         );
         let alpha = params.time.sin() as f32 * 0.5 + 0.5;
-        scene.push_layer(Mix::Normal, alpha, Affine::IDENTITY, &rect);
+        scene.push_layer(Fill::NonZero, Mix::Normal, alpha, Affine::IDENTITY, &rect);
         scene.fill(
             Fill::NonZero,
             Affine::translate((100.0, 100.0)) * Affine::scale(0.2),
@@ -1125,6 +1261,7 @@ mod impls {
         let mut depth = 0;
         for (width, color) in &options[..params.complexity.min(options.len() - 1)] {
             scene.push_layer(
+                Fill::NonZero,
                 Mix::Normal,
                 0.9,
                 Affine::IDENTITY,
@@ -1152,7 +1289,7 @@ mod impls {
                 const CLIPS_PER_FILL: usize = 3;
                 for _ in 0..CLIPS_PER_FILL {
                     let rot = Affine::rotate(rng.random_range(0.0..PI));
-                    scene.push_clip_layer(translate * rot, &base_tri);
+                    scene.push_clip_layer(Fill::NonZero, translate * rot, &base_tri);
                 }
                 let rot = Affine::rotate(rng.random_range(0.0..PI));
                 let color = Color::new([rng.random(), rng.random(), rng.random(), 1.]);
@@ -1212,7 +1349,7 @@ mod impls {
                 PathEl::LineTo((X0, Y1).into()),
                 PathEl::ClosePath,
             ];
-            scene.push_clip_layer(Affine::IDENTITY, &path);
+            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &path);
         }
         let rect = Rect::new(X0, Y0, X1, Y1);
         scene.fill(
@@ -1243,7 +1380,11 @@ mod impls {
             None,
             &make_diamond(1024.0, 125.0),
         );
-        scene.push_clip_layer(Affine::IDENTITY, &make_diamond(1024.0, 150.0));
+        scene.push_clip_layer(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &make_diamond(1024.0, 150.0),
+        );
         scene.fill(
             Fill::NonZero,
             Affine::IDENTITY,
@@ -1271,11 +1412,11 @@ mod impls {
             scene.fill(Fill::NonZero, transform, &radial, None, &rect);
         }
         const COLORS: &[Color] = &[palette::css::RED, palette::css::LIME, palette::css::BLUE];
-        scene.push_layer(Mix::Normal, 1.0, transform, &rect);
+        scene.push_layer(Fill::NonZero, Mix::Normal, 1.0, transform, &rect);
         for (i, c) in COLORS.iter().enumerate() {
             let linear = Gradient::new_linear((0.0, 0.0), (0.0, 200.0))
                 .with_stops([palette::css::WHITE, *c]);
-            scene.push_layer(blend, 1.0, transform, &rect);
+            scene.push_layer(Fill::NonZero, blend, 1.0, transform, &rect);
             // squash the ellipse
             let a = transform
                 * Affine::translate((100., 100.))
@@ -1579,7 +1720,7 @@ mod impls {
                 PathEl::ClosePath,
             ]
         };
-        scene.push_clip_layer(Affine::IDENTITY, &clip);
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
         {
             let text_size = 60.0 + 40.0 * (params.time as f32).sin();
             let s = "Some clipped text!";
@@ -1594,6 +1735,120 @@ mod impls {
         }
         scene.pop_layer();
 
+        // Even-odd clip-layer demo: a self-intersecting star ("pentagram") has different results
+        // under non-zero vs even-odd fill rules (even-odd produces a hole).
+        let demo_rect = Rect::new(250.0, 20.0, 450.0, 220.0);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            palette::css::BLUE,
+            None,
+            &demo_rect,
+        );
+        let mut star = BezPath::new();
+        let center = Point::new(350.0, 120.0);
+        let outer_r = 90.0;
+        let start_angle = -std::f64::consts::FRAC_PI_2;
+        let pts: [Point; 5] = core::array::from_fn(|i| {
+            let a = start_angle + (i as f64) * (2.0 * PI / 5.0);
+            center + Vec2::new(a.cos() * outer_r, a.sin() * outer_r)
+        });
+        let order = [0_usize, 2, 4, 1, 3];
+        star.move_to(pts[order[0]]);
+        for &idx in &order[1..] {
+            star.line_to(pts[idx]);
+        }
+        star.close_path();
+
+        scene.push_clip_layer(Fill::EvenOdd, Affine::IDENTITY, &star);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            palette::css::RED,
+            None,
+            &demo_rect,
+        );
+        scene.pop_layer();
+
+        // Stroke clip demo: clip to the stroked outline of a path.
+        let stroke_demo_rect = Rect::new(250.0, 240.0, 450.0, 440.0);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            palette::css::SLATE_GRAY,
+            None,
+            &stroke_demo_rect,
+        );
+        let mut stroke_star = BezPath::new();
+        let center = Point::new(350.0, 340.0);
+        let outer_r = 85.0;
+        let start_angle = -std::f64::consts::FRAC_PI_2;
+        let pts: [Point; 5] = core::array::from_fn(|i| {
+            let a = start_angle + (i as f64) * (2.0 * PI / 5.0);
+            center + Vec2::new(a.cos() * outer_r, a.sin() * outer_r)
+        });
+        let order = [0_usize, 2, 4, 1, 3];
+        stroke_star.move_to(pts[order[0]]);
+        for &idx in &order[1..] {
+            stroke_star.line_to(pts[idx]);
+        }
+        stroke_star.close_path();
+        let mut stroke = Stroke::new(18.0);
+        stroke.join = Join::Round;
+        stroke.start_cap = Cap::Round;
+        stroke.end_cap = Cap::Round;
+        scene.push_clip_layer(&stroke, Affine::IDENTITY, &stroke_star);
+        let grad = Gradient::new_linear((250.0, 240.0), (450.0, 440.0))
+            .with_stops([palette::css::MAGENTA, palette::css::CYAN]);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &grad,
+            None,
+            &stroke_demo_rect,
+        );
+        scene.pop_layer();
+
+        // Dashed stroke clip demo: clip to the stroked outline of a path.
+        let stroke_demo_rect = Rect::new(250.0, 460.0, 450.0, 660.0);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            palette::css::LIGHT_GREEN,
+            None,
+            &stroke_demo_rect,
+        );
+        let mut stroke_star = BezPath::new();
+        let center = Point::new(350.0, 560.0);
+        let outer_r = 85.0;
+        let start_angle = -std::f64::consts::FRAC_PI_2;
+        let pts: [Point; 5] = core::array::from_fn(|i| {
+            let a = start_angle + (i as f64) * (2.0 * PI / 5.0);
+            center + Vec2::new(a.cos() * outer_r, a.sin() * outer_r)
+        });
+        let order = [0_usize, 2, 4, 1, 3];
+        stroke_star.move_to(pts[order[0]]);
+        for &idx in &order[1..] {
+            stroke_star.line_to(pts[idx]);
+        }
+        stroke_star.close_path();
+        let mut stroke = Stroke::new(5.0);
+        stroke.dash_pattern = [10.].into_iter().collect();
+        stroke.join = Join::Round;
+        stroke.start_cap = Cap::Round;
+        stroke.end_cap = Cap::Round;
+        scene.push_clip_layer(&stroke, Affine::IDENTITY, &stroke_star);
+        let grad = Gradient::new_linear((250.0, 460.0), (450.0, 660.0))
+            .with_stops([palette::css::MAGENTA, palette::css::CYAN]);
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            &grad,
+            None,
+            &stroke_demo_rect,
+        );
+        scene.pop_layer();
+
         let large_background_rect = Rect::new(-1000.0, -1000.0, 2000.0, 2000.0);
         let inside_clip_rect = Rect::new(11.0, 13.399999999999999, 59.0, 56.6);
         let outside_clip_rect = Rect::new(
@@ -1606,6 +1861,7 @@ mod impls {
         let scale = 2.0;
 
         scene.push_layer(
+            Fill::NonZero,
             BlendMode {
                 mix: Mix::Normal,
                 compose: Compose::SrcOver,
@@ -1794,85 +2050,131 @@ mod impls {
         );
     }
 
-    pub(super) fn image_sampling(scene: &mut Scene, params: &mut SceneParams<'_>) {
-        params.resolution = Some(Vec2::new(1100., 1100.));
-        params.base_color = Some(palette::css::WHITE);
-        let mut blob: Vec<u8> = Vec::new();
-        [
-            palette::css::RED,
-            palette::css::BLUE,
-            palette::css::CYAN,
-            palette::css::MAGENTA,
-        ]
-        .iter()
-        .for_each(|c| {
-            blob.extend(c.to_rgba8().to_u8_array());
-        });
-        let data = Blob::new(Arc::new(blob));
-        let image = ImageData {
-            data,
-            format: ImageFormat::Rgba8,
-            width: 2,
-            height: 2,
-            alpha_type: ImageAlphaType::Alpha,
-        }
-        .into();
+    pub(super) fn image_sampling() -> impl FnMut(&mut Scene, &mut SceneParams<'_>) {
+        let image = sample_image_data();
+        move |scene, params| {
+            params.resolution = Some(Vec2::new(1100., 1100.));
+            params.base_color = Some(palette::css::WHITE);
 
-        scene.draw_image(
-            &image,
-            Affine::scale(200.).then_translate((100., 100.).into()),
-        );
-        scene.draw_image(
-            &image,
-            Affine::translate((-1., -1.))
-                // 45° rotation
-                .then_rotate(PI / 4.)
-                .then_translate((1., 1.).into())
-                // So the major axis is sqrt(2.) larger
-                .then_scale(200. * FRAC_1_SQRT_2)
-                .then_translate((100., 600.0).into()),
-        );
-        scene.draw_image(
-            &image,
-            Affine::scale_non_uniform(100., 200.).then_translate((600.0, 100.0).into()),
-        );
-        scene.draw_image(
-            &image,
-            Affine::skew(0.1, 0.25)
-                .then_scale(200.0)
-                .then_translate((600.0, 600.0).into()),
-        );
+            scene.draw_image(
+                &image,
+                Affine::scale(200.).then_translate((100., 100.).into()),
+            );
+            scene.draw_image(
+                &image,
+                Affine::translate((-1., -1.))
+                    // 45° rotation
+                    .then_rotate(PI / 4.)
+                    .then_translate((1., 1.).into())
+                    // So the major axis is sqrt(2.) larger
+                    .then_scale(200. * FRAC_1_SQRT_2)
+                    .then_translate((100., 600.0).into()),
+            );
+            scene.draw_image(
+                &image,
+                Affine::scale_non_uniform(100., 200.).then_translate((600.0, 100.0).into()),
+            );
+            scene.draw_image(
+                &image,
+                Affine::skew(0.1, 0.25)
+                    .then_scale(200.0)
+                    .then_translate((600.0, 600.0).into()),
+            );
+        }
+    }
+
+    pub(super) fn image_sampling_bicubic() -> impl FnMut(&mut Scene, &mut SceneParams<'_>) {
+        let image = sample_bicubic_image_data();
+        let image_low = ImageBrush::new(image.clone()).with_quality(ImageQuality::Low);
+        let image_medium = ImageBrush::new(image.clone()).with_quality(ImageQuality::Medium);
+        let image_high = ImageBrush::new(image).with_quality(ImageQuality::High);
+
+        move |scene, params| {
+            params.resolution = Some(Vec2::new(1400., 900.));
+            params.base_color = Some(palette::css::WHITE);
+
+            let transforms = [
+                Affine::translate((-8.0, -8.0))
+                    .then_rotate(PI / 5.0)
+                    .then_scale_non_uniform(18.0, 14.0)
+                    .then_translate((250.0, 270.0).into()),
+                Affine::translate((250.0, 670.0))
+                    * Affine::scale_non_uniform(20.0, 10.0)
+                    * Affine::skew(0.35, -0.15)
+                    * Affine::translate((-8.0, -8.0)),
+            ];
+
+            for transform in transforms {
+                scene.draw_image(&image_low, transform);
+                scene.draw_image(&image_medium, transform.then_translate((420.0, 0.0).into()));
+                scene.draw_image(&image_high, transform.then_translate((840.0, 0.0).into()));
+            }
+        }
+    }
+
+    pub(super) fn image_atlas_residency_demo(scene: &mut Scene, params: &mut SceneParams<'_>) {
+        params.resolution = Some(Vec2::new(1400., 900.));
+        params.base_color = Some(palette::css::WHITE);
+
+        let images = residency_demo_images();
+        let columns = 5;
+        let rows = 3;
+        for row in 0..rows {
+            for column in 0..columns {
+                let index = (row * columns + column) % images.len();
+                let image = &images[index];
+                let phase = params.time + (row * columns + column) as f64 * 0.35;
+                let center_x = 180.0 + column as f64 * 240.0 + phase.sin() * 45.0;
+                let center_y = 170.0 + row as f64 * 250.0 + (phase * 0.7).cos() * 30.0;
+                let rotation = (phase * 0.45).sin() * 0.5;
+                let scale = 1.1 + (phase * 1.3).cos() * 0.2;
+                let transform = Affine::translate((center_x, center_y))
+                    * Affine::rotate(rotation)
+                    * Affine::scale(scale)
+                    * Affine::translate((-48.0, -48.0));
+                scene.draw_image(image, transform);
+            }
+        }
+    }
+
+    pub(super) fn image_atlas_large_residency_demo(
+        scene: &mut Scene,
+        params: &mut SceneParams<'_>,
+    ) {
+        params.resolution = Some(Vec2::new(1700., 1100.));
+        params.base_color = Some(palette::css::WHITE);
+
+        let images = large_residency_demo_images();
+        let anchors = [
+            (430.0, 300.0),
+            (1270.0, 310.0),
+            (450.0, 800.0),
+            (1250.0, 780.0),
+        ];
+        for (index, (image, (anchor_x, anchor_y))) in images.iter().zip(anchors).enumerate() {
+            let phase = params.time + index as f64 * 0.8;
+            let offset_x = phase.sin() * 55.0;
+            let offset_y = (phase * 0.7).cos() * 40.0;
+            let rotation = (phase * 0.35).sin() * 0.22;
+            let scale = 0.19 + (phase * 0.45).cos() * 0.015;
+            let transform = Affine::translate((anchor_x + offset_x, anchor_y + offset_y))
+                * Affine::rotate(rotation)
+                * Affine::scale(scale)
+                * Affine::translate((-1024.0, -1024.0));
+            scene.draw_image(image, transform);
+        }
     }
 
     pub(super) fn image_extend_modes(
         quality: ImageQuality,
     ) -> impl FnMut(&mut Scene, &mut SceneParams<'_>) {
+        let image = ImageBrush::new(sample_image_data()).with_quality(quality);
         move |scene, params| {
             params.resolution = Some(Vec2::new(1500., 1500.));
             params.base_color = Some(palette::css::WHITE);
-            let mut blob: Vec<u8> = Vec::new();
-            [
-                palette::css::RED,
-                palette::css::BLUE,
-                palette::css::CYAN,
-                palette::css::MAGENTA,
-            ]
-            .iter()
-            .for_each(|c| {
-                blob.extend(c.to_rgba8().to_u8_array());
-            });
-            let data = Blob::new(Arc::new(blob));
-            let image = ImageBrush::new(ImageData {
-                data,
-                format: ImageFormat::Rgba8,
-                width: 2,
-                height: 2,
-                alpha_type: ImageAlphaType::Alpha,
-            })
-            .with_quality(quality);
             let brush_offset = Some(Affine::translate((2., 2.)));
             // Pad extend mode
-            let image = image.with_extend(Extend::Pad);
+            let image = image.clone().with_extend(Extend::Pad);
             scene.fill(
                 Fill::NonZero,
                 Affine::scale(100.).then_translate((100., 100.).into()),
@@ -1926,6 +2228,7 @@ mod impls {
             },
         );
         scene.push_layer(
+            Fill::NonZero,
             BlendMode::new(Mix::Normal, Compose::SrcOver),
             1.0,
             Affine::IDENTITY,
@@ -1949,6 +2252,7 @@ mod impls {
             },
         );
         scene.push_luminance_mask_layer(
+            Fill::NonZero,
             1.0,
             Affine::IDENTITY,
             &Rect {
@@ -1993,6 +2297,7 @@ mod impls {
             .unwrap();
         // HACK: Porter-Duff "over" the base color, restoring full alpha
         scene.push_layer(
+            Fill::NonZero,
             BlendMode::new(Mix::Normal, Compose::SrcOver),
             1.0,
             Affine::IDENTITY,
@@ -2028,6 +2333,7 @@ mod impls {
             },
         );
         scene.push_luminance_mask_layer(
+            Fill::NonZero,
             1.0,
             Affine::IDENTITY,
             &Rect {

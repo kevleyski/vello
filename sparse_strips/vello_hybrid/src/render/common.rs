@@ -9,16 +9,77 @@
 )]
 
 use bytemuck::{Pod, Zeroable};
+use vello_common::multi_atlas::AtlasConfig;
 
 // GPU paint structure sizes in texels (1 texel = 16 bytes for RGBA32Uint texture format).
-pub(crate) const GPU_ENCODED_IMAGE_SIZE_TEXELS: u32 =
-    (core::mem::size_of::<GpuEncodedImage>() / 16) as u32;
+pub(crate) const GPU_ENCODED_IMAGE_SIZE_TEXELS: u32 = (size_of::<GpuEncodedImage>() / 16) as u32;
 pub(crate) const GPU_LINEAR_GRADIENT_SIZE_TEXELS: u32 =
-    (core::mem::size_of::<GpuLinearGradient>() / 16) as u32;
+    (size_of::<GpuLinearGradient>() / 16) as u32;
 pub(crate) const GPU_RADIAL_GRADIENT_SIZE_TEXELS: u32 =
-    (core::mem::size_of::<GpuRadialGradient>() / 16) as u32;
-pub(crate) const GPU_SWEEP_GRADIENT_SIZE_TEXELS: u32 =
-    (core::mem::size_of::<GpuSweepGradient>() / 16) as u32;
+    (size_of::<GpuRadialGradient>() / 16) as u32;
+pub(crate) const GPU_SWEEP_GRADIENT_SIZE_TEXELS: u32 = (size_of::<GpuSweepGradient>() / 16) as u32;
+pub(crate) const GPU_BLURRED_ROUNDED_RECT_SIZE_TEXELS: u32 =
+    (size_of::<GpuBlurredRoundedRect>() / 16) as u32;
+
+// TODO: If we want to use native bilinear sampling for uploaded images,
+// we can pass 1 instead of 0 here.
+pub(crate) const IMAGE_PADDING: u16 = 0;
+
+pub(crate) fn normalize_atlas_config(
+    config: &mut AtlasConfig,
+    max_texture_dimension_2d: u32,
+    max_texture_array_layers: u32,
+    min_initial_atlas_count: usize,
+) {
+    config.atlas_size.0 = config.atlas_size.0.clamp(1, max_texture_dimension_2d);
+    config.atlas_size.1 = config.atlas_size.1.clamp(1, max_texture_dimension_2d);
+
+    let supported_max_atlases = (max_texture_array_layers as usize).max(min_initial_atlas_count);
+    config.max_atlases = config
+        .max_atlases
+        .clamp(min_initial_atlas_count, supported_max_atlases);
+    config.initial_atlas_count = config
+        .initial_atlas_count
+        .clamp(min_initial_atlas_count, config.max_atlases);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_atlas_config;
+    use vello_common::multi_atlas::AtlasConfig;
+
+    #[test]
+    fn normalize_atlas_config_clamps_to_backend_limits() {
+        let mut config = AtlasConfig {
+            initial_atlas_count: 8,
+            max_atlases: 16,
+            atlas_size: (8192, 2048),
+            ..Default::default()
+        };
+
+        normalize_atlas_config(&mut config, 4096, 4, 1);
+
+        assert_eq!(config.initial_atlas_count, 4);
+        assert_eq!(config.max_atlases, 4);
+        assert_eq!(config.atlas_size, (4096, 2048));
+    }
+
+    #[test]
+    fn normalize_atlas_config_enforces_minimum_initial_count() {
+        let mut config = AtlasConfig {
+            initial_atlas_count: 0,
+            max_atlases: 1,
+            atlas_size: (0, 0),
+            ..Default::default()
+        };
+
+        normalize_atlas_config(&mut config, 4096, 8, 2);
+
+        assert_eq!(config.initial_atlas_count, 2);
+        assert_eq!(config.max_atlases, 2);
+        assert_eq!(config.atlas_size, (1, 1));
+    }
+}
 
 /// Dimensions of the rendering target.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -30,7 +91,7 @@ pub struct RenderSize {
 }
 
 /// Configuration for the GPU renderer.
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub struct Config {
     /// Width of the rendering target.
@@ -42,9 +103,35 @@ pub struct Config {
     /// Number of trailing zeros in `alphas_tex_width` (log2 of width).
     /// Pre-calculated on CPU since downlevel targets do not support `firstTrailingBit`.
     pub alphas_tex_width_bits: u32,
+    /// Number of trailing zeros in the encoded paints texture width (log2 of width).
+    /// Pre-calculated on CPU since downlevel targets do not support `firstTrailingBit`.
+    pub encoded_paints_tex_width_bits: u32,
+    /// A horizontal offset to apply to strips.
+    pub strip_offset_x: i32,
+    /// A vertical offset to apply to strips.
+    pub strip_offset_y: i32,
+    /// Whether to flip the y-component of the NDC position.
+    ///
+    /// When transpiling a shader with naga, it applies a y-flip transform when
+    /// compiling to GLSL to account for the difference between the y-down
+    /// coordinate of WebGPU and the y-up coordinate system of WebGL framebuffers.
+    ///
+    /// However, for the native WebGL backend, we want to _avoid_ this transform so that we
+    /// can write directly into the user-provided framebuffer, but still ensure that the scene
+    /// is correctly flipped. Otherwise, we would need to allocate another framebuffer,
+    /// render into that and then pay the cost for flipping it.
+    ///
+    /// Therefore, we optionally negate the coordinates in NDC.
+    /// (Note that naga provides a flag for disabling this behavior. However, the problem
+    /// is that many parts of Vello Hybrid's code (such as slot textures) also assume a
+    /// y-down coordinate system. Therefore, just disabling this flag causes complications in
+    /// other places. From my experiments, it's much easier to enable the flag by default
+    /// and just apply the second negation manually in case we render to the final output surface
+    /// in the WebGL backend.
+    pub negate_ndc: u32,
 }
 
-/// Represents a GPU strip for rendering.
+/// A GPU strip instance for rendering.
 ///
 /// This struct corresponds to the `StripInstance` struct in the shader.
 /// See the `StripInstance` documentation in `render_strips.wgsl` for detailed field descriptions.
@@ -55,16 +142,20 @@ pub struct GpuStrip {
     pub x: u16,
     /// See `StripInstance::xy` documentation in `render_strips.wgsl`.
     pub y: u16,
-    /// See `StripInstance::widths` documentation in `render_strips.wgsl`.
+    /// See `StripInstance::dense_width_or_rect_height` documentation in `render_strips.wgsl`.
     pub width: u16,
-    /// See `StripInstance::widths` documentation in `render_strips.wgsl`.
-    pub dense_width: u16,
-    /// See `StripInstance::col_idx` documentation in `render_strips.wgsl`.
-    pub col_idx: u32,
+    /// See `StripInstance::dense_width_or_rect_height` documentation in `render_strips.wgsl`.
+    pub dense_width_or_rect_height: u16,
+    /// See `StripInstance::col_idx_or_rect_frac` documentation in `render_strips.wgsl`.
+    pub col_idx_or_rect_frac: u32,
     /// See `StripInstance::payload` documentation in `render_strips.wgsl`.
     pub payload: u32,
-    /// See `StripInstance::paint` documentation in `render_strips.wgsl`.
-    pub paint: u32,
+    /// See `StripInstance::paint_and_rect_flag` documentation in `render_strips.wgsl`.
+    pub paint_and_rect_flag: u32,
+    /// Painter's-order index used to compute z-depth for early-z rejection in shader.
+    /// In other words, the back-most draw has index 0 and every additional draw in front
+    /// has an incrementing index.
+    pub depth_index: u32,
 }
 
 /// Different types of GPU encoded paints.
@@ -78,6 +169,8 @@ pub(crate) enum GpuEncodedPaint {
     RadialGradient(GpuRadialGradient),
     /// An encoded sweep gradient.
     SweepGradient(GpuSweepGradient),
+    /// An encoded blurred rounded rectangle.
+    BlurredRoundedRect(GpuBlurredRoundedRect),
 }
 
 impl GpuEncodedPaint {
@@ -89,6 +182,7 @@ impl GpuEncodedPaint {
             Self::LinearGradient(paint) => bytemuck::bytes_of(paint),
             Self::RadialGradient(paint) => bytemuck::bytes_of(paint),
             Self::SweepGradient(paint) => bytemuck::bytes_of(paint),
+            Self::BlurredRoundedRect(paint) => bytemuck::bytes_of(paint),
         }
     }
 
@@ -122,8 +216,35 @@ pub(crate) struct GpuEncodedImage {
     pub image_offset: u32,
     /// Transform matrix [a, b, c, d, tx, ty].
     pub transform: [f32; 6],
+    /// Premultiplied tint color packed as RGBA8 unorm (`pack4x8unorm` layout).
+    /// A value of `0` means no tint is applied.
+    pub tint: u32,
+    /// [`TintMode`](vello_common::paint::TintMode) discriminant. Only meaningful when `tint != 0`.
+    pub tint_mode: u32,
+    /// Number of transparent padding pixels around the image in the atlas.
+    pub image_padding: u32,
+}
+
+/// GPU encoded blurred rounded rectangle data.
+/// Align to 16 bytes for `RGBA32Uint` alignment.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
+#[allow(dead_code, reason = "Clippy fails when --no-default-features")]
+pub(crate) struct GpuBlurredRoundedRect {
+    /// Transform matrix [a, b, c, d, tx, ty].
+    pub transform: [f32; 6],
+    /// Premultiplied color packed as RGBA8 unorm (`pack4x8unorm` layout).
+    pub color: u32,
+    /// Whether to paint the inverse (`1 - alpha`) of the blur coverage
+    pub invert: u32,
+    /// Blur parameters: exponent, reciprocal exponent, scale, and inverse standard deviation.
+    pub params0: [f32; 4],
+    /// Blur parameters: minimum edge length, adjusted width, adjusted height, and outer radius.
+    pub params1: [f32; 4],
+    /// Blur parameters [width, height].
+    pub size: [f32; 2],
     /// Padding for 16-byte alignment.
-    pub _padding: [u32; 3],
+    pub _padding1: [u32; 2],
 }
 
 /// GPU encoded linear gradient data.
@@ -252,6 +373,22 @@ pub(crate) fn pack_image_params(
     (atlas_index << 6) | (extend_y << 4) | (extend_x << 2) | quality
 }
 
+/// Pack an optional [`Tint`](vello_common::paint::Tint) into a (`tint_color_u32`, `tint_mode_u32`) pair for the GPU.
+///
+/// The tint color is premultiplied before packing into a u32 in the same layout
+/// as WGSL `pack4x8unorm`. Returns `(0, 0)` when no tint is specified, which
+/// the shader interprets as "no tint".
+#[inline(always)]
+pub(crate) fn pack_tint(tint: Option<vello_common::paint::Tint>) -> (u32, u32) {
+    match tint {
+        Some(t) => {
+            let color = t.color.premultiply().to_rgba8().to_u32();
+            (color, t.mode.as_u32())
+        }
+        None => (0, 0),
+    }
+}
+
 #[cfg(all(target_arch = "wasm32", feature = "webgl", feature = "wgpu"))]
 pub(crate) fn maybe_warn_about_webgl_feature_conflict() {
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -268,7 +405,7 @@ For optimal performance and binary size on web targets, use only the dedicated W
 }
 
 #[cfg(all(
-    any(all(target_arch = "wasm32", feature = "webgl"), feature = "wgpu"),
+    any(feature = "webgl", feature = "wgpu"),
     not(all(target_arch = "wasm32", feature = "webgl", feature = "wgpu"))
 ))]
 pub(crate) fn maybe_warn_about_webgl_feature_conflict() {}

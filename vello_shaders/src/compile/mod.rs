@@ -85,12 +85,9 @@ pub struct ShaderInfo {
 }
 
 impl ShaderInfo {
-    #[cfg_attr(
-        target_pointer_width = "64",
-        allow(
-            clippy::result_large_err,
-            reason = "Deferred: This is a cold code path."
-        )
+    #[allow(
+        clippy::result_large_err,
+        reason = "Deferred: This is a cold code path."
     )]
     pub fn new(name: &str, source: String, entry_point: &str) -> Result<Self> {
         let module = wgsl::parse_str(&source).map_err(|error| Error::new(&source, name, error))?;
@@ -158,10 +155,8 @@ impl ShaderInfo {
             } else {
                 resource.ty = BindType::BufReadOnly;
                 match var.space {
-                    AddressSpace::Storage { access } => {
-                        if access.contains(StorageAccess::STORE) {
-                            resource.ty = BindType::Buffer;
-                        }
+                    AddressSpace::Storage { access } if access.contains(StorageAccess::STORE) => {
+                        resource.ty = BindType::Buffer;
                     }
                     AddressSpace::Uniform => {
                         resource.ty = BindType::Uniform;

@@ -4,7 +4,9 @@
 //! Utility functions shared across different tests.
 
 use crate::renderer::Renderer;
+use glifo::Glyph;
 use image::{Rgba, RgbaImage, load_from_memory};
+use serde::Serializer;
 use skrifa::MetadataProvider;
 use skrifa::raw::FileRef;
 use smallvec::smallvec;
@@ -12,7 +14,6 @@ use std::cmp::max;
 use std::sync::Arc;
 use vello_common::color::DynamicColor;
 use vello_common::color::palette::css::{BLUE, GREEN, RED, WHITE, YELLOW};
-use vello_common::glyph::Glyph;
 use vello_common::kurbo::{BezPath, Join, Point, Rect, Shape, Stroke, Vec2};
 use vello_common::peniko::{Blob, ColorStop, ColorStops, FontData};
 use vello_common::pixmap::Pixmap;
@@ -20,6 +21,51 @@ use vello_cpu::{Level, RenderMode};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
+
+/// Aggregate diff report with statistics and individual pixel differences.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DiffReport {
+    /// Total number of pixels that differ.
+    pub pixel_count: usize,
+    /// Maximum absolute difference per channel [R, G, B, A].
+    pub max_difference: [i16; 4],
+    /// Individual pixel differences.
+    pub pixels: Vec<PixelDiff>,
+}
+
+/// Represents a single pixel difference between reference and actual images.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct PixelDiff {
+    /// The x coordinate of the differing pixel.
+    pub x: u32,
+    /// The y coordinate of the differing pixel.
+    pub y: u32,
+    /// The RGBA values from the target image (i.e. the saved reference).
+    // Note that this field name is chosen to be the same length as `actual`
+    // That makes it easier to compare the results in the printed JSON.
+    #[serde(serialize_with = "hex_string")]
+    pub target: [u8; 4],
+    /// The RGBA values from the actual image.
+    #[serde(serialize_with = "hex_string")]
+    pub actual: [u8; 4],
+    /// Per-channel difference (actual - target) as signed values.
+    pub difference: [i16; 4],
+}
+
+/// Serialize a [`[u8; 4]`](primitive@core::array) pixel as a hex string through serde.
+///
+/// E.g. `[0, 255, 0, 255]` becomes #00ff00. Notice that the alpha is not included if fully opaque.
+fn hex_string<S>([r, g, b, a]: &[u8; 4], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if *a != 255 {
+        serializer.collect_str(&format_args!("#{r:02x}{g:02x}{b:02x}{a:02x}"))
+    } else {
+        serializer.collect_str(&format_args!("#{r:02x}{g:02x}{b:02x}"))
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 static REFS_PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
@@ -37,15 +83,18 @@ macro_rules! load_image {
         #[cfg(target_arch = "wasm32")]
         {
             let bytes = include_bytes!(concat!("../tests/assets/", $name, ".png"));
-            std::sync::Arc::new(vello_common::pixmap::Pixmap::from_png(&bytes[..]).unwrap())
+            std::sync::Arc::new(
+                vello_common::pixmap::Pixmap::from_png(std::io::Cursor::new(bytes)).unwrap(),
+            )
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(format!("tests/assets/{}.png", $name));
+            let bytes = std::fs::read(path).unwrap();
             std::sync::Arc::new(
-                vello_common::pixmap::Pixmap::from_png(std::fs::File::open(path).unwrap()).unwrap(),
+                vello_common::pixmap::Pixmap::from_png(std::io::Cursor::new(bytes)).unwrap(),
             )
         }
     }};
@@ -58,26 +107,27 @@ pub(crate) fn get_ctx<T: Renderer>(
     num_threads: u16,
     level: &str,
     render_mode: RenderMode,
+    default_blending_only: bool,
 ) -> T {
     let level = match level {
         #[cfg(target_arch = "aarch64")]
         "neon" => Level::Neon(
             Level::try_detect()
-                .unwrap_or(Level::fallback())
+                .unwrap_or(Level::baseline())
                 .as_neon()
                 .expect("neon should be available"),
         ),
         #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
         "wasm_simd128" => Level::WasmSimd128(
             Level::try_detect()
-                .unwrap_or(Level::fallback())
+                .unwrap_or(Level::baseline())
                 .as_wasm_simd128()
                 .expect("wasm simd128 should be available"),
         ),
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         "sse42" => {
             if std::arch::is_x86_feature_detected!("sse4.2") {
-                Level::Sse4_2(unsafe { vello_common::fearless_simd::Sse4_2::new_unchecked() })
+                Level::Sse4_2(unsafe { fearless_simd::Sse4_2::new_unchecked() })
             } else {
                 panic!("sse4.2 feature not detected");
             }
@@ -87,7 +137,7 @@ pub(crate) fn get_ctx<T: Renderer>(
             if std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
             {
-                Level::Avx2(unsafe { vello_common::fearless_simd::Avx2::new_unchecked() })
+                Level::Avx2(unsafe { fearless_simd::Avx2::new_unchecked() })
             } else {
                 panic!("avx2 or fma feature not detected");
             }
@@ -96,7 +146,14 @@ pub(crate) fn get_ctx<T: Renderer>(
         _ => panic!("unknown level: {level}"),
     };
 
-    let mut ctx = T::new(width, height, num_threads, level, render_mode);
+    let mut ctx = T::new(
+        width,
+        height,
+        num_threads,
+        level,
+        render_mode,
+        default_blending_only,
+    );
 
     if !transparent {
         let path = Rect::new(0.0, 0.0, width as f64, height as f64).to_path(0.1);
@@ -108,7 +165,7 @@ pub(crate) fn get_ctx<T: Renderer>(
     ctx
 }
 
-pub(crate) fn render_pixmap(ctx: &impl Renderer) -> Pixmap {
+pub(crate) fn render_pixmap(ctx: &mut impl Renderer) -> Pixmap {
     let mut pixmap = Pixmap::new(ctx.width(), ctx.height());
     ctx.render_to_pixmap(&mut pixmap);
     pixmap
@@ -281,7 +338,7 @@ pub(crate) fn stops_blue_green_red_yellow() -> ColorStops {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn check_ref(
-    ctx: &impl Renderer,
+    ctx: &mut impl Renderer,
     // The name of the test.
     test_name: &str,
     // The name of the specific instance of the test that is being run
@@ -289,7 +346,7 @@ pub(crate) fn check_ref(
     specific_name: &str,
     // Tolerance for pixel differences.
     threshold: u8,
-    diff_pixels: u16,
+    diff_pixels: u32,
     // Whether the test instance is the "gold standard" and should be used
     // for creating reference images.
     is_reference: bool,
@@ -301,10 +358,17 @@ pub(crate) fn check_ref(
     let ref_path = REFS_PATH.join(format!("{test_name}.png"));
 
     let write_ref_image = || {
-        let optimized =
-            oxipng::optimize_from_memory(&encoded_image, &oxipng::Options::max_compression())
-                .unwrap();
-        std::fs::write(&ref_path, optimized).unwrap();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let optimized =
+                oxipng::optimize_from_memory(&encoded_image, &oxipng::Options::max_compression())
+                    .unwrap();
+            std::fs::write(&ref_path, optimized).unwrap();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            panic("Reference images cannot be created from WASM");
+        }
     };
 
     if !ref_path.exists() {
@@ -321,9 +385,9 @@ pub(crate) fn check_ref(
         .into_rgba8();
     let actual = load_from_memory(&encoded_image).unwrap().into_rgba8();
 
-    let diff_image = get_diff(&ref_image, &actual, threshold, diff_pixels);
+    let diff_result = get_diff(&ref_image, &actual, threshold, diff_pixels);
 
-    if let Some(diff_image) = diff_image {
+    if let Some((diff_image, diff_data)) = diff_result {
         if should_replace() && is_reference {
             write_ref_image();
             panic!("test was replaced");
@@ -338,20 +402,40 @@ pub(crate) fn check_ref(
             .save_with_format(&diff_path, image::ImageFormat::Png)
             .unwrap();
 
-        panic!("test didnt match reference image");
+        // Save diff data as JSON
+        let json_path = DIFFS_PATH.join(format!("{specific_name}.json"));
+        let max_difference: [i16; 4] = diff_data.iter().fold([0; 4], |mut max, p| {
+            for (m, d) in max.iter_mut().zip(&p.difference) {
+                *m = (*m).max(d.abs());
+            }
+            max
+        });
+        let report = DiffReport {
+            pixel_count: diff_data.len(),
+            max_difference,
+            pixels: diff_data,
+        };
+        let json_data = serde_json::to_string_pretty(&report).unwrap();
+        std::fs::write(&json_path, json_data).unwrap();
+
+        panic!(
+            "test didn't match reference image\n  diff image: {}\n  diff report: {}",
+            diff_path.display(),
+            json_path.display()
+        );
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn check_ref(
-    ctx: &impl Renderer,
+    ctx: &mut impl Renderer,
     _test_name: &str,
     // The name of the specific instance of the test that is being run
     // (e.g. test_gpu, test_cpu_u8, etc.)
     specific_name: &str,
     // Tolerance for pixel differences.
     threshold: u8,
-    diff_pixels: u16,
+    diff_pixels: u32,
     // Must be `false` on `wasm32` as reference image cannot be written to filesystem.
     is_reference: bool,
     ref_data: &[u8],
@@ -365,7 +449,7 @@ pub(crate) fn check_ref(
     let ref_image = load_from_memory(ref_data).unwrap().into_rgba8();
 
     let diff_image = get_diff(&ref_image, &actual, threshold, diff_pixels);
-    if let Some(ref img) = diff_image {
+    if let Some((ref img, _)) = diff_image {
         append_diff_image_to_browser_document(specific_name, img);
         panic!("test didn't match reference image. Scroll to bottom of browser to view diff.");
     }
@@ -444,12 +528,13 @@ fn get_diff(
     expected_image: &RgbaImage,
     actual_image: &RgbaImage,
     threshold: u8,
-    diff_pixels: u16,
-) -> Option<RgbaImage> {
+    diff_pixels: u32,
+) -> Option<(RgbaImage, Vec<PixelDiff>)> {
     let width = max(expected_image.width(), actual_image.width());
     let height = max(expected_image.height(), actual_image.height());
 
     let mut diff_image = RgbaImage::new(width * 3, height);
+    let mut diff_data = Vec::new();
 
     let mut pixel_diff = 0;
 
@@ -465,6 +550,18 @@ fn get_diff(
                     if is_pix_diff(expected, actual, threshold) {
                         pixel_diff += 1;
                         diff_image.put_pixel(x + width, y, Rgba([255, 0, 0, 255]));
+                        diff_data.push(PixelDiff {
+                            x,
+                            y,
+                            target: expected.0,
+                            actual: actual.0,
+                            difference: [
+                                i16::from(actual.0[0]) - i16::from(expected.0[0]),
+                                i16::from(actual.0[1]) - i16::from(expected.0[1]),
+                                i16::from(actual.0[2]) - i16::from(expected.0[2]),
+                                i16::from(actual.0[3]) - i16::from(expected.0[3]),
+                            ],
+                        });
                     } else {
                         diff_image.put_pixel(x + width, y, Rgba([0, 0, 0, 255]));
                     }
@@ -473,23 +570,54 @@ fn get_diff(
                     pixel_diff += 1;
                     diff_image.put_pixel(x + 2 * width, y, *actual);
                     diff_image.put_pixel(x + width, y, Rgba([255, 0, 0, 255]));
+                    diff_data.push(PixelDiff {
+                        x,
+                        y,
+                        target: [0, 0, 0, 0],
+                        actual: actual.0,
+                        difference: [
+                            i16::from(actual.0[0]),
+                            i16::from(actual.0[1]),
+                            i16::from(actual.0[2]),
+                            i16::from(actual.0[3]),
+                        ],
+                    });
                 }
                 (None, Some(expected)) => {
                     pixel_diff += 1;
                     diff_image.put_pixel(x, y, *expected);
                     diff_image.put_pixel(x + width, y, Rgba([255, 0, 0, 255]));
+                    diff_data.push(PixelDiff {
+                        x,
+                        y,
+                        target: expected.0,
+                        actual: [0, 0, 0, 0],
+                        difference: [
+                            -i16::from(expected.0[0]),
+                            -i16::from(expected.0[1]),
+                            -i16::from(expected.0[2]),
+                            -i16::from(expected.0[3]),
+                        ],
+                    });
                 }
                 _ => {
                     pixel_diff += 1;
                     diff_image.put_pixel(x, y, Rgba([255, 0, 0, 255]));
                     diff_image.put_pixel(x + width, y, Rgba([255, 0, 0, 255]));
+                    diff_data.push(PixelDiff {
+                        x,
+                        y,
+                        target: [0, 0, 0, 0],
+                        actual: [0, 0, 0, 0],
+                        difference: [0, 0, 0, 0],
+                    });
                 }
             }
         }
     }
 
     if pixel_diff > diff_pixels {
-        Some(diff_image)
+        Some((diff_image, diff_data))
     } else {
         None
     }

@@ -5,9 +5,10 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use peniko::color::Rgba8;
+#[cfg(feature = "png")]
+use std::io::{BufRead, Seek};
 
-use crate::peniko::color::PremulRgba8;
+use crate::peniko::color::{PremulRgba8, Rgba8};
 
 #[cfg(feature = "png")]
 extern crate std;
@@ -21,13 +22,70 @@ pub struct Pixmap {
     height: u16,
     /// Buffer of the pixmap in RGBA8 format.
     buf: Vec<PremulRgba8>,
+    /// Whether the pixmap may have non-opaque pixels.
+    ///
+    /// Note: This may become stale if pixels are modified via [`data_mut()`](Self::data_mut),
+    /// [`data_as_u8_slice_mut()`](Self::data_as_u8_slice_mut), or [`set_pixel()`](Self::set_pixel).
+    may_have_transparency: bool,
+}
+
+/// A mutable view into premultiplied RGBA8 pixmap data.
+#[derive(Debug)]
+pub struct PixmapMut<'a> {
+    /// Width of the pixmap in pixels.
+    width: u16,
+    /// Height of the pixmap in pixels.
+    height: u16,
+    /// Buffer of the pixmap in RGBA8 format.
+    buf: &'a mut [u8],
+}
+
+impl<'a> PixmapMut<'a> {
+    /// Create a new mutable pixmap view.
+    ///
+    /// Returns `None` if `buf` is not exactly `width * height * 4` bytes long.
+    pub fn new(width: u16, height: u16, buf: &'a mut [u8]) -> Option<Self> {
+        if buf.len() == usize::from(width) * usize::from(height) * 4 {
+            Some(Self { width, height, buf })
+        } else {
+            None
+        }
+    }
+
+    /// Return the width of the pixmap.
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Return the height of the pixmap.
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    /// Returns a mutable reference to the underlying data as premultiplied RGBA8 bytes.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        self.buf
+    }
+}
+
+impl<'a> From<&'a mut Pixmap> for PixmapMut<'a> {
+    fn from(pixmap: &'a mut Pixmap) -> Self {
+        pixmap.as_mut()
+    }
 }
 
 impl Pixmap {
     /// Create a new pixmap with the given width and height in pixels.
+    ///
+    /// All pixels are initialized to transparent black.
     pub fn new(width: u16, height: u16) -> Self {
         let buf = vec![PremulRgba8::from_u32(0); width as usize * height as usize];
-        Self { width, height, buf }
+        Self {
+            width,
+            height,
+            buf,
+            may_have_transparency: true,
+        }
     }
 
     /// Create a new pixmap with the given premultiplied RGBA8 data.
@@ -36,10 +94,35 @@ impl Pixmap {
     ///
     /// The pixels are in row-major order.
     ///
+    /// This assumes the image may have transparent pixels. Use
+    /// [`from_parts_with_opacity`](Self::from_parts_with_opacity) if you already
+    /// know the opacity status to enable optimizations.
+    ///
     /// # Panics
     ///
     /// Panics if the `data` vector is not of length `width * height`.
     pub fn from_parts(data: Vec<PremulRgba8>, width: u16, height: u16) -> Self {
+        Self::from_parts_with_opacity(data, width, height, true)
+    }
+
+    /// Create a new pixmap with the given premultiplied RGBA8 data and precomputed opacity flag.
+    ///
+    /// The `data` vector must be of length `width * height` exactly.
+    ///
+    /// The pixels are in row-major order.
+    ///
+    /// Use this when you've already determined whether the data contains
+    /// non-opaque pixels to avoid redundant scanning.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `data` vector is not of length `width * height`.
+    pub fn from_parts_with_opacity(
+        data: Vec<PremulRgba8>,
+        width: u16,
+        height: u16,
+        may_have_transparency: bool,
+    ) -> Self {
         assert_eq!(
             data.len(),
             usize::from(width) * usize::from(height),
@@ -49,6 +132,7 @@ impl Pixmap {
             width,
             height,
             buf: data,
+            may_have_transparency,
         }
     }
 
@@ -59,12 +143,14 @@ impl Pixmap {
     /// black. If the pixmap buffer is larger than required, the buffer is truncated and its
     /// reserved capacity is unchanged.
     pub fn resize(&mut self, width: u16, height: u16) {
+        let new_len = usize::from(width) * usize::from(height);
+        // If we're growing, new pixels are transparent black
+        if new_len > self.buf.len() {
+            self.may_have_transparency = true;
+        }
         self.width = width;
         self.height = height;
-        self.buf.resize(
-            usize::from(width) * usize::from(height),
-            PremulRgba8::from_u32(0),
-        );
+        self.buf.resize(new_len, PremulRgba8::from_u32(0));
     }
 
     /// Shrink the capacity of the pixmap buffer to fit the pixmap's current size.
@@ -90,6 +176,36 @@ impl Pixmap {
         self.height
     }
 
+    /// Returns whether the pixmap may have non-opaque pixels.
+    ///
+    /// This value is computed at construction time. It may become stale if pixels are
+    /// modified directly via [`data_mut()`](Self::data_mut),
+    /// [`data_as_u8_slice_mut()`](Self::data_as_u8_slice_mut), or [`set_pixel()`](Self::set_pixel).
+    ///
+    /// Use [`set_may_have_transparency()`](Self::set_may_have_transparency) to manually update the flag,
+    /// or [`recompute_may_have_transparency()`](Self::recompute_may_have_transparency) to recalculate it
+    /// by scanning all pixels.
+    pub fn may_have_transparency(&self) -> bool {
+        self.may_have_transparency
+    }
+
+    /// Manually set the `may_have_transparency` flag.
+    ///
+    /// Use this after modifying pixels via [`data_mut()`](Self::data_mut) or
+    /// [`set_pixel()`](Self::set_pixel) when you know whether the image has
+    /// non-opaque pixels.
+    pub fn set_may_have_transparency(&mut self, may_have_transparency: bool) {
+        self.may_have_transparency = may_have_transparency;
+    }
+
+    /// Recalculate `may_have_transparency` by scanning all pixels.
+    ///
+    /// Use this after modifying pixels via [`data_mut()`](Self::data_mut) or
+    /// [`set_pixel()`](Self::set_pixel) when you need accurate opacity information.
+    pub fn recompute_may_have_transparency(&mut self) {
+        self.may_have_transparency = self.buf.iter().any(|pixel| pixel.a != 255);
+    }
+
     /// Apply an alpha value to the whole pixmap.
     pub fn multiply_alpha(&mut self, alpha: u8) {
         #[expect(
@@ -106,11 +222,16 @@ impl Pixmap {
                 a: multiply(pixel.a),
             };
         }
+
+        // If we applied a non-opaque alpha, the image now has transparency
+        if alpha != 255 {
+            self.may_have_transparency = true;
+        }
     }
 
     /// Create a pixmap from a PNG file.
     #[cfg(feature = "png")]
-    pub fn from_png(data: impl std::io::Read) -> Result<Self, png::DecodingError> {
+    pub fn from_png(data: impl BufRead + Seek) -> Result<Self, png::DecodingError> {
         let mut decoder = png::Decoder::new(data);
         decoder.set_transformations(
             png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
@@ -148,7 +269,7 @@ impl Pixmap {
             }
             png::ColorType::Rgba => {
                 debug_assert_eq!(
-                    pixmap.data_as_u8_slice().len(),
+                    Some(pixmap.data_as_u8_slice().len()),
                     reader.output_buffer_size(),
                     "The pixmap buffer should have the same number of bytes as the image."
                 );
@@ -156,11 +277,11 @@ impl Pixmap {
             }
             png::ColorType::GrayscaleAlpha => {
                 debug_assert_eq!(
-                    pixmap.data().len() * 2,
+                    Some(pixmap.data().len() * 2),
                     reader.output_buffer_size(),
                     "The pixmap buffer should have twice the number of bytes of the grayscale image."
                 );
-                let mut grayscale_data = vec![0; reader.output_buffer_size()];
+                let mut grayscale_data = vec![0; reader.output_buffer_size().unwrap_or_default()];
                 reader.next_frame(&mut grayscale_data)?;
 
                 for (grayscale_pixel, pixmap_pixel) in
@@ -177,17 +298,23 @@ impl Pixmap {
             }
         };
 
+        let mut may_have_transparency = false;
         for pixel in pixmap.data_mut() {
-            let alpha = u16::from(pixel.a);
+            let alpha = pixel.a;
+            if alpha != 255 {
+                may_have_transparency = true;
+            }
+            let alpha_u16 = u16::from(alpha);
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "Overflow should be impossible."
             )]
-            let premultiply = |e: u8| ((u16::from(e) * alpha) / 255) as u8;
+            let premultiply = |e: u8| ((u16::from(e) * alpha_u16) / 255) as u8;
             pixel.r = premultiply(pixel.r);
             pixel.g = premultiply(pixel.g);
             pixel.b = premultiply(pixel.b);
         }
+        pixmap.may_have_transparency = may_have_transparency;
 
         Ok(pixmap)
     }
@@ -210,6 +337,10 @@ impl Pixmap {
     pub fn data(&self) -> &[PremulRgba8] {
         &self.buf
     }
+
+    // TODO: Now that we have `as_mut`, maybe we don't need the
+    // mutable methods. If we add a `PixmapRef` we can also remove the
+    // non-mutable ones.
 
     /// Returns a mutable reference to the underlying data as premultiplied RGBA8.
     ///
@@ -234,6 +365,15 @@ impl Pixmap {
         bytemuck::cast_slice_mut(&mut self.buf)
     }
 
+    /// Return a mutable view into this pixmap's pixel data.
+    pub fn as_mut(&mut self) -> PixmapMut<'_> {
+        PixmapMut {
+            width: self.width,
+            height: self.height,
+            buf: bytemuck::cast_slice_mut(&mut self.buf),
+        }
+    }
+
     /// Sample a pixel from the pixmap.
     ///
     /// The pixel data is [premultiplied RGBA8][PremulRgba8].
@@ -248,6 +388,17 @@ impl Pixmap {
     #[inline(always)]
     pub fn sample_idx(&self, idx: u32) -> PremulRgba8 {
         self.buf[idx as usize]
+    }
+
+    /// Set a pixel in the pixmap at the given coordinates.
+    ///
+    /// The pixel data should be [premultiplied RGBA8][PremulRgba8]. The coordinate system has
+    /// its origin at the top-left corner, with `x` increasing to the right and `y` increasing
+    /// downward.
+    #[inline(always)]
+    pub fn set_pixel(&mut self, x: u16, y: u16, pixel: PremulRgba8) {
+        let idx = self.width as usize * y as usize + x as usize;
+        self.buf[idx] = pixel;
     }
 
     /// Consume the pixmap, returning the data as the underlying [`Vec`] of premultiplied RGBA8.

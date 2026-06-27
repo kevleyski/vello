@@ -244,15 +244,8 @@ fn gradient_base<S: Simd, N: FineKernel<S>>(
         ..Default::default()
     };
 
-    let paint = grad.encode_into(&mut paints, Affine::IDENTITY);
-    fill_single(
-        &paint,
-        &paints,
-        WideTile::WIDTH as usize,
-        b,
-        default_blend(),
-        fine,
-    );
+    let paint = grad.encode_into(&mut paints, Affine::IDENTITY, None);
+    fill_single(&paint, &paints, WideTile::WIDTH, b, default_blend(), fine);
 }
 
 fn stops_blue_green_red_yellow_opaque() -> ColorStops {

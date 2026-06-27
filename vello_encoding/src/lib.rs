@@ -26,7 +26,6 @@
 )]
 #![allow(
     unnameable_types,
-    clippy::shadow_unrelated,
     reason = "Deferred, only apply in some feature sets so not expect"
 )]
 
@@ -58,7 +57,7 @@ pub use draw::{
     DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient, DrawTag,
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
-pub use glyph::{Glyph, GlyphRun};
+pub use glyph::{FontEmbolden, Glyph, GlyphRun};
 pub use mask::{make_mask_lut, make_mask_lut_16};
 pub use math::Transform;
 pub use monoid::Monoid;

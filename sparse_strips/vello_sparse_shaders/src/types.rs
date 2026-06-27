@@ -26,7 +26,7 @@ impl ReflectionMap {
     /// Create a new `ReflectionMap` given the [`naga`] compile info.
     pub(crate) fn new(info: ReflectionInfo, global_vars: &Arena<GlobalVariable>) -> Self {
         debug_assert_eq!(info.varying.len(), 0, "unimplemented");
-        debug_assert_eq!(info.push_constant_items.len(), 0, "unimplemented");
+        debug_assert_eq!(info.immediates_items.len(), 0, "unimplemented");
         let mut texture_mapping = BTreeMap::default();
         let mut uniforms = BTreeMap::default();
 
@@ -145,6 +145,7 @@ mod tests {
         ShaderStage,
         back::glsl::{self, PipelineOptions, Version},
         front::wgsl,
+        proc::BoundsCheckPolicies,
         valid::{Capabilities, ValidationFlags, Validator},
     };
 
@@ -199,7 +200,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             .unwrap();
 
         // Write the vertex glsl shader.
-        let options = naga::back::glsl::Options {
+        let options = glsl::Options {
             version: Version::Embedded {
                 version: 300,
                 is_webgl: true,
@@ -221,7 +222,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             &info,
             &options,
             &pipeline_options,
-            Default::default(),
+            BoundsCheckPolicies::default(),
         )
         .unwrap();
         let reflection_info = w.write().unwrap();
@@ -243,7 +244,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let info = Validator::new(ValidationFlags::all(), Capabilities::default())
             .validate(&module)
             .unwrap();
-        let options = naga::back::glsl::Options {
+        let options = glsl::Options {
             version: Version::Embedded {
                 version: 300,
                 is_webgl: true,
@@ -262,7 +263,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             &info,
             &options,
             &pipeline_options,
-            Default::default(),
+            BoundsCheckPolicies::default(),
         )
         .unwrap();
         let reflection_info = w.write().unwrap();

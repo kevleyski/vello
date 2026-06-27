@@ -5,121 +5,180 @@
 
 use crate::fine::COLOR_COMPONENTS;
 use alloc::vec::Vec;
-use vello_common::coarse::WideTile;
+use vello_common::geometry::RectU16;
+use vello_common::pixmap::PixmapMut;
 use vello_common::tile::Tile;
 
-#[derive(Debug)]
-pub struct Regions<'a> {
-    regions: Vec<Region<'a>>,
-}
-
-impl<'a> Regions<'a> {
-    pub fn new(width: u16, height: u16, mut buffer: &'a mut [u8]) -> Self {
-        let buf_width = usize::from(width);
-        let buf_height = usize::from(height);
-
-        let row_advance = buf_width * COLOR_COMPONENTS;
-
-        let height_regions = buf_height.div_ceil(usize::from(Tile::HEIGHT));
-        let width_regions = buf_width.div_ceil(usize::from(WideTile::WIDTH));
-
-        let mut regions = Vec::with_capacity(height_regions * width_regions);
-
-        let mut next_lines: [&'a mut [u8]; Tile::HEIGHT as usize] =
-            [&mut [], &mut [], &mut [], &mut []];
-
-        for y in 0..height_regions {
-            let base_y = y * usize::from(Tile::HEIGHT);
-            let region_height = usize::from(Tile::HEIGHT).min(buf_height - base_y);
-
-            for line in next_lines.iter_mut().take(region_height) {
-                let (head, tail) = buffer.split_at_mut(row_advance);
-                *line = head;
-                buffer = tail;
-            }
-
-            for x in 0..width_regions {
-                let mut areas: [&mut [u8]; Tile::HEIGHT as usize] =
-                    [&mut [], &mut [], &mut [], &mut []];
-
-                // All rows have the same width, so we can just take the first row.
-                let region_width =
-                    (usize::from(WideTile::WIDTH) * COLOR_COMPONENTS).min(next_lines[0].len());
-
-                for h in 0..region_height {
-                    let next = core::mem::take(&mut next_lines[h]);
-                    let (head, tail) = next.split_at_mut(region_width);
-                    areas[h] = head;
-                    next_lines[h] = tail;
-                }
-
-                regions.push(Region::new(
-                    areas,
-                    u16::try_from(x).unwrap(),
-                    u16::try_from(y).unwrap(),
-                    region_width as u16 / COLOR_COMPONENTS as u16,
-                    region_height as u16,
-                ));
-            }
-        }
-
-        Self { regions }
-    }
-
-    /// Apply the given function to each region. The functions will be applied
-    /// in parallel in the current threadpool.
-    #[cfg(feature = "multithreading")]
-    pub fn update_regions_par(&mut self, func: impl Fn(&mut Region<'_>) + Send + Sync) {
-        use rayon::iter::ParallelIterator;
-        use rayon::prelude::IntoParallelRefMutIterator;
-
-        self.regions.par_iter_mut().for_each(func);
-    }
-
-    /// Apply the given function to each region.
-    pub fn update_regions(&mut self, func: impl FnMut(&mut Region<'_>)) {
-        self.regions.iter_mut().for_each(func);
-    }
-}
-
-/// A rectangular region containing the pixels from one wide tile.
-///
-/// For wide tiles at the right/bottom edge, it might contain less pixels
-/// than the actual wide tile, if the pixmap width/height isn't a multiple of the
-/// tile width/height.
+/// A view into a part of a single strip row of a pixmap.
 #[derive(Default, Debug)]
 pub struct Region<'a> {
-    /// The x coordinate of the wide tile this region covers.
-    pub(crate) x: u16,
-    /// The y coordinate of the wide tile this region covers.
-    pub(crate) y: u16,
-    pub width: u16,
-    pub height: u16,
+    pub(crate) row_idx: usize,
+    width: u16,
+    pub(crate) height: u16,
     areas: [&'a mut [u8]; Tile::HEIGHT as usize],
 }
 
 impl<'a> Region<'a> {
-    pub(crate) fn new(
-        areas: [&'a mut [u8]; Tile::HEIGHT as usize],
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
+    #[doc(hidden)]
+    pub fn new(pixmap: &'a mut PixmapMut<'_>, rect: RectU16) -> Self {
+        Self::new_from_row(pixmap, rect, 0)
+    }
+
+    pub(crate) fn new_from_row(
+        pixmap: &'a mut PixmapMut<'_>,
+        rect: RectU16,
+        row_idx: usize,
     ) -> Self {
-        Self {
-            areas,
-            x,
-            y,
+        let width = rect.width();
+        let height = rect.height().min(Tile::HEIGHT);
+        let row_stride = usize::from(pixmap.width()) * COLOR_COMPONENTS;
+        let start_offset = usize::from(rect.y0) * row_stride;
+        let x_offset = usize::from(rect.x0) * COLOR_COMPONENTS;
+        let buffer = pixmap.data_mut();
+        Self::from_rows(
+            row_idx,
             width,
             height,
-        }
+            row_stride,
+            x_offset,
+            &mut buffer[start_offset..],
+        )
     }
 
     pub(crate) fn row_mut(&mut self, y: u16) -> &mut [u8] {
         self.areas[usize::from(y)]
     }
 
-    pub fn areas(&mut self) -> &mut [&'a mut [u8]; Tile::HEIGHT as usize] {
+    pub(crate) fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Return a horizontal sub-span of the region.
+    pub(crate) fn sub_span(&mut self, x: u16, width: u16) -> Region<'_> {
+        let x_offset = usize::from(x) * COLOR_COMPONENTS;
+        let row_width_bytes = usize::from(width) * COLOR_COMPONENTS;
+        let mut areas: [&mut [u8]; Tile::HEIGHT as usize] = [&mut [], &mut [], &mut [], &mut []];
+
+        for (source, area) in self
+            .areas
+            .iter_mut()
+            .take(usize::from(self.height))
+            .zip(areas.iter_mut())
+        {
+            let (_, source) = source.split_at_mut(x_offset);
+            let (source, _) = source.split_at_mut(row_width_bytes);
+            *area = source;
+        }
+
+        Region {
+            row_idx: self.row_idx,
+            width,
+            height: self.height,
+            areas,
+        }
+    }
+
+    pub(crate) fn areas(&mut self) -> &mut [&'a mut [u8]; Tile::HEIGHT as usize] {
         &mut self.areas
+    }
+
+    fn from_rows(
+        row_idx: usize,
+        width: u16,
+        height: u16,
+        row_stride: usize,
+        x_offset: usize,
+        mut rows: &'a mut [u8],
+    ) -> Self {
+        let row_width_bytes = usize::from(width) * COLOR_COMPONENTS;
+        let mut areas: [&mut [u8]; Tile::HEIGHT as usize] = [&mut [], &mut [], &mut [], &mut []];
+
+        for area in areas.iter_mut().take(usize::from(height)) {
+            let (row, rest) = rows.split_at_mut(row_stride);
+            let (_, row) = row.split_at_mut(x_offset);
+            let (row, _) = row.split_at_mut(row_width_bytes);
+            *area = row;
+            rows = rest;
+        }
+
+        Self {
+            row_idx,
+            width,
+            height,
+            areas,
+        }
+    }
+}
+
+/// Split a pixmap into an array of regions.
+pub(crate) struct Regions<'a> {
+    regions: Vec<Region<'a>>,
+}
+
+impl<'a> Regions<'a> {
+    pub(crate) fn new(
+        target: &'a mut PixmapMut<'_>,
+        scene_size: (u16, u16),
+        offset: (u16, u16),
+        row_count: usize,
+    ) -> Self {
+        let (dst_x, dst_y) = offset;
+
+        let (scene_width, scene_height) = scene_size;
+        let width = scene_width.min(target.width().saturating_sub(dst_x));
+        let height = scene_height.min(target.height().saturating_sub(dst_y));
+
+        if width == 0 || height == 0 {
+            return Self {
+                regions: Vec::new(),
+            };
+        }
+
+        let row_count = row_count.min(usize::from(height).div_ceil(Tile::HEIGHT as usize));
+        let stride = usize::from(target.width()) * COLOR_COMPONENTS;
+        let x_offset = usize::from(dst_x) * COLOR_COMPONENTS;
+        let render_bytes = usize::from(height) * stride;
+        let target = target.data_mut();
+        let mut remaining = &mut target[usize::from(dst_y) * stride..][..render_bytes];
+        let mut regions = Vec::with_capacity(row_count);
+
+        for row_idx in 0..row_count {
+            let row_y = row_idx as u16 * Tile::HEIGHT;
+            let row_height = (height - row_y).min(Tile::HEIGHT);
+            let band_len = usize::from(row_height) * stride;
+            let (buffer, rest) = remaining.split_at_mut(band_len);
+            regions.push(Region::from_rows(
+                row_idx, width, row_height, stride, x_offset, buffer,
+            ));
+            remaining = rest;
+        }
+
+        Self { regions }
+    }
+
+    pub(crate) fn update(&mut self, func: impl FnMut(&mut Region<'_>)) {
+        self.regions.iter_mut().for_each(func);
+    }
+
+    #[cfg(feature = "multithreading")]
+    pub(crate) fn update_par(&mut self, func: impl Fn(&mut Region<'_>) + Send + Sync) {
+        use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+
+        self.regions.par_iter_mut().for_each(func);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Regions;
+    use vello_common::pixmap::Pixmap;
+
+    #[test]
+    fn regions_with_off_target_offsets_do_not_panic() {
+        for offset in [(20, 0), (0, 20)] {
+            let mut pixmap = Pixmap::new(10, 10);
+            let mut pixmap = pixmap.as_mut();
+            let _regions = Regions::new(&mut pixmap, (4, 4), offset, 1);
+        }
     }
 }

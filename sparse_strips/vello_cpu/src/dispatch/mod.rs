@@ -5,20 +5,18 @@
 pub(crate) mod multi_threaded;
 pub(crate) mod single_threaded;
 
-use crate::RenderMode;
-use crate::kurbo::{Affine, BezPath, Stroke};
+use crate::RasterizerSettings;
+use crate::kurbo::{Affine, BezPath, Rect, Stroke};
 use crate::peniko::{BlendMode, Fill};
+use crate::record::FilterData;
 use core::fmt::Debug;
-use vello_common::coarse::Wide;
 use vello_common::encode::EncodedPaint;
 use vello_common::mask::Mask;
-use vello_common::paint::Paint;
-use vello_common::strip::Strip;
-use vello_common::strip_generator::StripStorage;
+use vello_common::paint::{ImageResolver, Paint};
+use vello_common::pixmap::PixmapMut;
 
-pub(crate) trait Dispatcher: Debug + Send + Sync {
-    fn wide(&self) -> &Wide;
-    fn generate_wide_cmd(&mut self, strip_buf: &[Strip], paint: Paint, blend_mode: BlendMode);
+pub(crate) trait Dispatcher: Debug + Send {
+    fn has_layers(&self) -> bool;
     fn fill_path(
         &mut self,
         path: &BezPath,
@@ -27,6 +25,7 @@ pub(crate) trait Dispatcher: Debug + Send + Sync {
         paint: Paint,
         blend_mode: BlendMode,
         aliasing_threshold: Option<u8>,
+        mask: Option<Mask>,
     );
     fn stroke_path(
         &mut self,
@@ -36,7 +35,24 @@ pub(crate) trait Dispatcher: Debug + Send + Sync {
         paint: Paint,
         blend_mode: BlendMode,
         aliasing_threshold: Option<u8>,
+        mask: Option<Mask>,
     );
+    /// Fill a pixel-aligned rectangle with the current paint.
+    fn fill_rect_fast(
+        &mut self,
+        rect: &Rect,
+        paint: Paint,
+        blend_mode: BlendMode,
+        mask: Option<Mask>,
+    );
+    fn push_clip_path(
+        &mut self,
+        path: &BezPath,
+        fill_rule: Fill,
+        transform: Affine,
+        aliasing_threshold: Option<u8>,
+    );
+    fn pop_clip_path(&mut self);
     fn push_layer(
         &mut self,
         clip_path: Option<&BezPath>,
@@ -46,17 +62,19 @@ pub(crate) trait Dispatcher: Debug + Send + Sync {
         opacity: f32,
         aliasing_threshold: Option<u8>,
         mask: Option<Mask>,
+        filter_data: Option<FilterData>,
     );
     fn pop_layer(&mut self);
     fn reset(&mut self);
     fn flush(&mut self);
     fn rasterize(
         &self,
-        buffer: &mut [u8],
-        render_mode: RenderMode,
-        width: u16,
-        height: u16,
+        target: PixmapMut<'_>,
+        scene_width: u16,
+        scene_height: u16,
+        settings: RasterizerSettings,
         encoded_paints: &[EncodedPaint],
+        image_resolver: &dyn ImageResolver,
     );
-    fn strip_storage_mut(&mut self) -> &mut StripStorage;
+    fn is_multi_threaded(&self) -> bool;
 }

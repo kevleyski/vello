@@ -34,14 +34,13 @@ pub(crate) fn estimate_render_task_cost(task: &RenderTaskType, paths: &[PathEl])
             LAYER_COST
                 + clip_path
                     .as_ref()
-                    .map(|(path_range, transform)| {
+                    .map(|(path_range, transform, _)| {
                         let path = &paths[path_range.start as usize..path_range.end as usize];
                         estimate_path_cost(segments(path.iter().copied()), *transform, false)
                     })
                     .unwrap_or(0.0)
         }
         RenderTaskType::PopLayer => LAYER_COST,
-        RenderTaskType::WideCommand { .. } => LAYER_COST,
     }
 }
 

@@ -20,25 +20,25 @@ use web_sys::{Event, HtmlCanvasElement, KeyboardEvent, MouseEvent, WheelEvent};
 
 /// State that handles scene rendering and interactions
 struct AppState {
-    scenes: Box<[AnyScene<vello_cpu::RenderContext>]>,
+    scenes: Box<[AnyScene<RenderContext>]>,
     current_scene: usize,
     transform: Affine,
     mouse_down: bool,
     last_cursor_position: Option<Vec2>,
     width: u32,
     height: u32,
-    renderer: vello_cpu::RenderContext,
+    renderer: RenderContext,
     pixmap: vello_common::pixmap::Pixmap,
     need_render: bool,
     canvas: HtmlCanvasElement,
 }
 
 impl AppState {
-    fn new(canvas: HtmlCanvasElement, scenes: Box<[AnyScene<vello_cpu::RenderContext>]>) -> Self {
+    fn new(canvas: HtmlCanvasElement, scenes: Box<[AnyScene<RenderContext>]>) -> Self {
         let width = canvas.width();
         let height = canvas.height();
 
-        let renderer = vello_cpu::RenderContext::new_with(
+        let renderer = RenderContext::new_with(
             width as u16,
             height as u16,
             vello_cpu::RenderSettings {
@@ -72,7 +72,10 @@ impl AppState {
         self.scenes[self.current_scene].render(&mut self.renderer, self.transform);
 
         // Render the current scene with transform
-        self.renderer.render_to_pixmap(&mut self.pixmap);
+        self.renderer.render(
+            &mut self.pixmap,
+            self.scenes[self.current_scene].resources_mut(),
+        );
         let rgba_bytes = self.pixmap.data_as_u8_slice();
         let image_data = web_sys::ImageData::new_with_u8_clamped_array_and_sh(
             wasm_bindgen::Clamped(rgba_bytes),
@@ -101,7 +104,7 @@ impl AppState {
         self.height = height;
 
         self.pixmap.resize(width as u16, height as u16);
-        self.renderer = vello_cpu::RenderContext::new_with(
+        self.renderer = RenderContext::new_with(
             width as u16,
             height as u16,
             vello_cpu::RenderSettings {
@@ -132,6 +135,14 @@ impl AppState {
     fn reset_transform(&mut self) {
         self.transform = Affine::IDENTITY;
         self.need_render = true;
+    }
+
+    fn handle_key(&mut self, key: &str) {
+        if let Some(scene) = self.scenes.get_mut(self.current_scene)
+            && scene.handle_key(key)
+        {
+            self.need_render = true;
+        }
     }
 
     fn handle_mouse_down(&mut self, x: f64, y: f64) {
@@ -200,7 +211,7 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         .unwrap()
         .create_element("canvas")
         .unwrap()
-        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .dyn_into::<HtmlCanvasElement>()
         .unwrap();
     canvas.set_width(canvas_width as u32);
     canvas.set_height(canvas_height as u32);
@@ -221,10 +232,13 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
 
     let pixmap1 = ImageScene::read_flower_image();
     let pixmap2 = ImageScene::read_cowboy_image();
-    let scenes = vello_example_scenes::get_example_scenes::<RenderContext>(vec![
-        ImageSource::Pixmap(Arc::new(pixmap1)),
-        ImageSource::Pixmap(Arc::new(pixmap2)),
-    ]);
+    let scenes = vello_example_scenes::get_example_scenes::<RenderContext>(
+        vello_example_scenes::Capabilities::default(),
+        vec![
+            ImageSource::Pixmap(Arc::new(pixmap1)),
+            ImageSource::Pixmap(Arc::new(pixmap2)),
+        ],
+    );
 
     let app_state = Rc::new(RefCell::new(AppState::new(canvas.clone(), scenes)));
 
@@ -322,15 +336,15 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     {
         let app_state = app_state.clone();
         let document = web_sys::window().unwrap().document().unwrap();
-        let closure =
-            Closure::wrap(
-                Box::new(move |event: KeyboardEvent| match event.key().as_str() {
-                    "ArrowRight" => app_state.borrow_mut().next_scene(),
-                    "ArrowLeft" => app_state.borrow_mut().prev_scene(),
-                    " " => app_state.borrow_mut().reset_transform(),
-                    _ => {}
-                }) as Box<dyn FnMut(_)>,
-            );
+        let closure = Closure::wrap(Box::new(move |event: KeyboardEvent| {
+            let key = event.key();
+            match key.as_str() {
+                "ArrowRight" => app_state.borrow_mut().next_scene(),
+                "ArrowLeft" => app_state.borrow_mut().prev_scene(),
+                " " => app_state.borrow_mut().reset_transform(),
+                _ => app_state.borrow_mut().handle_key(key.as_str()),
+            }
+        }) as Box<dyn FnMut(_)>);
         document
             .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
             .unwrap();

@@ -4,7 +4,6 @@
 use crate::fine::macros::{f32x16_painter, u8x16_painter};
 use crate::fine::{PosExt, Splat4thExt, u8_to_f32};
 use crate::kurbo::Point;
-use crate::peniko::ImageQuality;
 use vello_common::encode::EncodedImage;
 use vello_common::fearless_simd::{Bytes, Simd, SimdBase, SimdFloat, f32x4, f32x16, u8x16, u32x4};
 use vello_common::pixmap::Pixmap;
@@ -25,38 +24,43 @@ impl<'a, S: Simd> PlainNNImagePainter<'a, S> {
         simd: S,
         image: &'a EncodedImage,
         pixmap: &'a Pixmap,
-        start_x: u16,
-        start_y: u16,
+        start_x: f64,
+        start_y: f64,
     ) -> Self {
         let data = ImagePainterData::new(simd, image, pixmap, start_x, start_y);
 
-        let y_positions = extend(
-            simd,
-            f32x4::splat_pos(
-                simd,
-                data.cur_pos.y as f32,
-                data.x_advances.1,
-                data.y_advances.1,
-            ),
-            image.sampler.y_extend,
-            data.height,
-            data.height_inv,
-        );
+        simd.vectorize(
+            #[inline(always)]
+            || {
+                let y_positions = extend(
+                    simd,
+                    f32x4::splat_pos(
+                        simd,
+                        data.cur_pos.y as f32,
+                        data.x_advances.1,
+                        data.y_advances.1,
+                    ),
+                    image.sampler.y_extend,
+                    data.height,
+                    data.height_inv,
+                );
 
-        let cur_x_pos = f32x4::splat_pos(
-            simd,
-            data.cur_pos.x as f32,
-            data.x_advances.0,
-            data.y_advances.0,
-        );
+                let cur_x_pos = f32x4::splat_pos(
+                    simd,
+                    data.cur_pos.x as f32,
+                    data.x_advances.0,
+                    data.y_advances.0,
+                );
 
-        Self {
-            data,
-            advance: image.x_advance.x as f32,
-            y_positions,
-            cur_x_pos,
-            simd,
-        }
+                Self {
+                    data,
+                    advance: image.x_advance.x as f32,
+                    y_positions,
+                    cur_x_pos,
+                    simd,
+                }
+            },
+        )
     }
 }
 
@@ -95,8 +99,8 @@ impl<'a, S: Simd> NNImagePainter<'a, S> {
         simd: S,
         image: &'a EncodedImage,
         pixmap: &'a Pixmap,
-        start_x: u16,
-        start_y: u16,
+        start_x: f64,
+        start_y: f64,
     ) -> Self {
         let data = ImagePainterData::new(simd, image, pixmap, start_x, start_y);
 
@@ -107,6 +111,7 @@ impl<'a, S: Simd> NNImagePainter<'a, S> {
 impl<S: Simd> Iterator for NNImagePainter<'_, S> {
     type Item = u8x16<S>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let x_positions = extend(
             self.simd,
@@ -145,19 +150,27 @@ impl<S: Simd> Iterator for NNImagePainter<'_, S> {
 u8x16_painter!(NNImagePainter<'_, S>);
 
 /// A painter for images with bilinear or bicubic filtering.
+///
+/// The painter is generic over sampler quality using the const-generic `QUALITY` parameter.
+///
+/// - Set `QUALITY` to `1` for bilinear sampling; or
+/// - set `QUALITY` to `2` for bicubic sampling.
+///
+/// These values for `QUALITY` are the same numeric values as defined by
+/// [`crate::peniko::ImageQuality`].
 #[derive(Debug)]
-pub(crate) struct FilteredImagePainter<'a, S: Simd> {
+pub(crate) struct FilteredImagePainter<'a, S: Simd, const QUALITY: u8> {
     data: ImagePainterData<'a, S>,
     simd: S,
 }
 
-impl<'a, S: Simd> FilteredImagePainter<'a, S> {
+impl<'a, S: Simd, const QUALITY: u8> FilteredImagePainter<'a, S, QUALITY> {
     pub(crate) fn new(
         simd: S,
         image: &'a EncodedImage,
         pixmap: &'a Pixmap,
-        start_x: u16,
-        start_y: u16,
+        start_x: f64,
+        start_y: f64,
     ) -> Self {
         let data = ImagePainterData::new(simd, image, pixmap, start_x, start_y);
 
@@ -165,9 +178,10 @@ impl<'a, S: Simd> FilteredImagePainter<'a, S> {
     }
 }
 
-impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
+impl<S: Simd, const QUALITY: u8> Iterator for FilteredImagePainter<'_, S, QUALITY> {
     type Item = f32x16<S>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let x_positions = f32x4::splat_pos(
             self.simd,
@@ -193,15 +207,8 @@ impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
         // center of the location we are sampling, and sample those points
         // using a cubic filter to weight each location's contribution.
 
-        // Note that this `fract` has different behavior for negative numbers than the normal,
-        // one.
-        #[inline(always)]
-        fn fract<S: Simd>(val: f32x4<S>) -> f32x4<S> {
-            val - val.floor()
-        }
-
-        let x_fract = fract(x_positions + 0.5);
-        let y_fract = fract(y_positions + 0.5);
+        let x_fract = fract_floor(x_positions + 0.5);
+        let y_fract = fract_floor(y_positions + 0.5);
 
         let mut interpolated_color = f32x16::splat(self.simd, 0.0);
 
@@ -233,9 +240,9 @@ impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
             };
         }
 
-        match self.data.image.sampler.quality {
-            ImageQuality::Low => unreachable!(),
-            ImageQuality::Medium => {
+        match QUALITY {
+            // medium quality: bilinear
+            1 => {
                 // <https://github.com/google/skia/blob/220738774f7a0ce4a6c7bd17519a336e5e5dea5b/src/opts/SkRasterPipeline_opts.h#L5039-L5078>
                 let cx = [1.0 - x_fract, x_fract];
                 let cy = [1.0 - y_fract, y_fract];
@@ -259,13 +266,14 @@ impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
                         let color_sample = sample(x_positions, y_positions);
                         let w = element_wise_splat(self.simd, cx[x_idx] * cy[y_idx]);
 
-                        interpolated_color = w.madd(color_sample, interpolated_color);
+                        interpolated_color = w.mul_add(color_sample, interpolated_color);
                     }
                 }
 
                 interpolated_color *= f32x16::splat(self.simd, 1.0 / 255.0);
             }
-            ImageQuality::High => {
+            // high quality: bicubic
+            2 => {
                 // Compare to <https://github.com/google/skia/blob/84ff153b0093fc83f6c77cd10b025c06a12c5604/src/opts/SkRasterPipeline_opts.h#L5030-L5075>.
                 let cx = weights(self.simd, x_fract);
                 let cy = weights(self.simd, y_fract);
@@ -298,7 +306,7 @@ impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
                         let color_sample = sample(x_positions, y_positions);
                         let w = element_wise_splat(self.simd, cx[x_idx] * cy[y_idx]);
 
-                        interpolated_color = w.madd(color_sample, interpolated_color);
+                        interpolated_color = w.mul_add(color_sample, interpolated_color);
                     }
                 }
 
@@ -313,10 +321,13 @@ impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
                 // compositing with u8-based values. Because of this, we need to clamp
                 // to the alpha value.
                 interpolated_color = interpolated_color
+                    .min(alphas)
                     .min(f32x16::splat(self.simd, 1.0))
-                    .max(f32x16::splat(self.simd, 0.0))
-                    .min(alphas);
+                    .max(f32x16::splat(self.simd, 0.0));
             }
+            _ => panic!(
+                "Unknown value for `FilteredImagePainter`'s const-generic `QUALITY` parameter. Expected `1` for bilinear or `2` for bicubic, got: `{QUALITY}`."
+            ),
         }
 
         self.data.cur_pos += self.data.image.x_advance;
@@ -325,7 +336,19 @@ impl<S: Simd> Iterator for FilteredImagePainter<'_, S> {
     }
 }
 
-f32x16_painter!(FilteredImagePainter<'_, S>);
+// Bilinear
+f32x16_painter!(FilteredImagePainter<'_, S, 1>);
+// Bicubic
+f32x16_painter!(FilteredImagePainter<'_, S, 2>);
+
+/// Computes the positive fractional part of a value: `val - val.floor()`.
+///
+/// Unlike `f32::fract()`, this always returns a value in [0, 1),
+/// even for negative inputs.
+#[inline(always)]
+pub(crate) fn fract_floor<S: Simd>(val: f32x4<S>) -> f32x4<S> {
+    val - val.floor()
+}
 
 /// Common data used by different image painters
 #[derive(Debug)]
@@ -347,34 +370,39 @@ impl<'a, S: Simd> ImagePainterData<'a, S> {
         simd: S,
         image: &'a EncodedImage,
         pixmap: &'a Pixmap,
-        start_x: u16,
-        start_y: u16,
+        start_x: f64,
+        start_y: f64,
     ) -> Self {
-        let width = pixmap.width() as f32;
-        let height = pixmap.height() as f32;
-        let start_pos = image.transform * Point::new(f64::from(start_x), f64::from(start_y));
+        simd.vectorize(
+            #[inline(always)]
+            || {
+                let width = pixmap.width() as f32;
+                let height = pixmap.height() as f32;
+                let start_pos = image.transform * Point::new(start_x, start_y);
 
-        let width_inv = f32x4::splat(simd, 1.0 / width);
-        let height_inv = f32x4::splat(simd, 1.0 / height);
-        let width = f32x4::splat(simd, width);
-        let width_u32 = u32x4::splat(simd, pixmap.width() as u32);
-        let height = f32x4::splat(simd, height);
+                let width_inv = f32x4::splat(simd, 1.0 / width);
+                let height_inv = f32x4::splat(simd, 1.0 / height);
+                let width = f32x4::splat(simd, width);
+                let width_u32 = u32x4::splat(simd, pixmap.width() as u32);
+                let height = f32x4::splat(simd, height);
 
-        let x_advances = (image.x_advance.x as f32, image.x_advance.y as f32);
-        let y_advances = (image.y_advance.x as f32, image.y_advance.y as f32);
+                let x_advances = (image.x_advance.x as f32, image.x_advance.y as f32);
+                let y_advances = (image.y_advance.x as f32, image.y_advance.y as f32);
 
-        Self {
-            cur_pos: start_pos,
-            pixmap,
-            x_advances,
-            y_advances,
-            image,
-            width,
-            height,
-            width_u32,
-            width_inv,
-            height_inv,
-        }
+                Self {
+                    cur_pos: start_pos,
+                    pixmap,
+                    x_advances,
+                    y_advances,
+                    image,
+                    width,
+                    height,
+                    width_u32,
+                    width_inv,
+                    height_inv,
+                }
+            },
+        )
     }
 }
 
@@ -385,7 +413,7 @@ pub(crate) fn sample<S: Simd>(
     x_positions: f32x4<S>,
     y_positions: f32x4<S>,
 ) -> u8x16<S> {
-    let idx = x_positions.cvt_u32() + y_positions.cvt_u32() * data.width_u32;
+    let idx = x_positions.to_int::<u32x4<S>>() + y_positions.to_int::<u32x4<S>>() * data.width_u32;
 
     u32x4::from_slice(
         simd,
@@ -396,7 +424,7 @@ pub(crate) fn sample<S: Simd>(
             data.pixmap.sample_idx(idx[3]).to_u32(),
         ],
     )
-    .reinterpret_u8()
+    .to_bytes()
 }
 
 #[inline(always)]
@@ -407,17 +435,14 @@ pub(crate) fn extend<S: Simd>(
     max: f32x4<S>,
     inv_max: f32x4<S>,
 ) -> f32x4<S> {
-    // We cannot chose f32::EPSILON here because for example 30.0 - f32::EPSILON is still 30.0.
-    // This bias should be large enough for all numbers that we support (i.e. <= u16::MAX).
-    let bias = f32x4::splat(simd, 0.01);
-
     match extend {
-        // Note that max should be exclusive, so subtract a small bias to enforce that.
-        // Otherwise, we might sample out-of-bounds pixels.
-        crate::peniko::Extend::Pad => val.min(max - bias).max(f32x4::splat(simd, 0.0)),
+        // Note that max should be exclusive, so subtract one to enforce that.
+        // Since the maximum image dimensions we support is u16::MAX, subtracting 1 in f32
+        // is enough to ensure that all numbers are subtracted correctly.
+        crate::peniko::Extend::Pad => val.min(max - 1.0).max(f32x4::splat(simd, 0.0)),
         crate::peniko::Extend::Repeat => {
             // floor := (val * inv_max).floor() * max is the nearest multiple of `max` below val.
-            max.madd(-(val * inv_max).floor(), val)
+            max.mul_add(-(val * inv_max).floor(), val)
                 // In certain edge cases, we might still end up with a higher number.
                 .min(max - 1.0)
         }
@@ -435,7 +460,7 @@ pub(crate) fn extend<S: Simd>(
             // our `max` is always an integer number, u and s must also be an integer number
             // and thus `m_bits` must be 0.
             // Note that this is a wrapping sub!
-            let biased_bits = m_bits - bias_in_ulps.cvt_u32();
+            let biased_bits = m_bits - bias_in_ulps.to_int::<u32x4<S>>();
             f32x4::from_bytes(biased_bits.to_bytes())
                 // In certain edge cases, we might still end up with a higher number.
                 .min(max - 1.0)
@@ -494,7 +519,7 @@ fn single_weight<S: Simd>(
     c: f32x4<S>,
     d: f32x4<S>,
 ) -> f32x4<S> {
-    t.madd(d, c).madd(t, b).madd(t, a)
+    t.mul_add(d, c).mul_add(t, b).mul_add(t, a)
 }
 
 /// Mitchell filter with the variables B = 1/3 and C = 1/3.

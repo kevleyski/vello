@@ -3,7 +3,7 @@
 
 //! Native WebGL2 rendering module for the sparse strips CPU/GPU rendering engine.
 //!
-//! This module provides identical functionality as the [`render_wgpu`] module, however the graphics
+//! This module provides identical functionality as the [`wgpu`] module, however the graphics
 //! context is the browser's native [`WebGl2RenderingContext`]. Hence, this module is only available
 //! when targeting `wasm32` with the "webgl" feature flag active.
 //!
@@ -20,44 +20,64 @@
 only break in edge cases, and some of them are also only related to conversions from f64 to f32."
 )]
 
+use crate::render::common::IMAGE_PADDING;
 use crate::{
-    AtlasConfig, GpuStrip, RenderError, RenderSettings, RenderSize,
+    GpuStrip, RenderError, RenderSettings, RenderSize, Resources,
+    filter::{FilterContext, FilterInstanceData, FilterPassState, FilterPassTarget},
     gradient_cache::GradientRampCache,
-    image_cache::{ImageCache, ImageResource},
-    multi_atlas::AtlasId,
     render::{
         Config,
         common::{
-            GPU_ENCODED_IMAGE_SIZE_TEXELS, GPU_LINEAR_GRADIENT_SIZE_TEXELS,
-            GPU_RADIAL_GRADIENT_SIZE_TEXELS, GPU_SWEEP_GRADIENT_SIZE_TEXELS, GpuEncodedImage,
+            GPU_BLURRED_ROUNDED_RECT_SIZE_TEXELS, GPU_ENCODED_IMAGE_SIZE_TEXELS,
+            GPU_LINEAR_GRADIENT_SIZE_TEXELS, GPU_RADIAL_GRADIENT_SIZE_TEXELS,
+            GPU_SWEEP_GRADIENT_SIZE_TEXELS, GpuBlurredRoundedRect, GpuEncodedImage,
             GpuEncodedPaint, GpuLinearGradient, GpuRadialGradient, GpuSweepGradient,
-            pack_image_offset, pack_image_params, pack_image_size, pack_radial_kind_and_swapped,
-            pack_texture_width_and_extend_mode,
+            normalize_atlas_config, pack_image_offset, pack_image_params, pack_image_size,
+            pack_radial_kind_and_swapped, pack_texture_width_and_extend_mode, pack_tint,
         },
     },
     scene::Scene,
-    schedule::{LoadOp, RendererBackend, Scheduler},
+    schedule::{
+        LoadOp, RendererBackend, RootRenderTarget, Scheduler, SchedulerState, StripPassRenderTarget,
+    },
 };
-
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
-use core::{fmt::Debug, mem};
+use core::fmt::Debug;
+#[cfg(feature = "probe")]
+use core::ops::Deref;
+#[cfg(feature = "text")]
+use glifo::{GLYPH_PADDING, PendingClearRect};
+use resource::{Buffer, FragmentShader, Framebuffer, Program, Texture, VertexArray, VertexShader};
+#[cfg(feature = "probe")]
+use thiserror::Error;
+use vello_common::image_cache::{ImageCache, ImageResource};
+#[cfg(feature = "probe")]
+use vello_common::multi_atlas::AllocationStrategy;
+use vello_common::multi_atlas::{AtlasConfig, AtlasId};
+#[cfg(feature = "probe")]
+use vello_common::probe::Probe;
+use vello_common::render_graph::LayerId;
 use vello_common::{
     coarse::WideTile,
-    encode::{EncodedGradient, EncodedKind, EncodedPaint, MAX_GRADIENT_LUT_SIZE, RadialKind},
-    kurbo::Affine,
-    paint::ImageSource,
-    peniko,
+    encode::{
+        EncodedBlurredRoundedRectangle, EncodedGradient, EncodedKind, EncodedPaint,
+        MAX_GRADIENT_LUT_SIZE, RadialKind,
+    },
+    paint::{ImageId, ImageSource},
+    peniko::{self},
     pixmap::Pixmap,
     tile::Tile,
 };
-use vello_sparse_shaders::{clear_slots, render_strips};
+use vello_sparse_shaders::{clear_slots, filters, render_strips};
+#[cfg(feature = "probe")]
+use web_sys::WebGlSync;
 use web_sys::wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
-    WebGl2RenderingContext, WebGlBuffer, WebGlFramebuffer, WebGlProgram, WebGlTexture,
-    WebGlUniformLocation, WebGlVertexArrayObject,
+    HtmlCanvasElement, WebGl2RenderingContext, WebGlBuffer, WebGlFramebuffer, WebGlProgram,
+    WebGlShader, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject,
 };
 
 /// Placeholder value for uninitialized GPU encoded paints.
@@ -75,6 +95,13 @@ fn get_max_texture_dimension_2d(gl: &WebGl2RenderingContext) -> u32 {
         .unwrap() as u32
 }
 
+fn get_max_texture_array_layers(gl: &WebGl2RenderingContext) -> u32 {
+    gl.get_parameter(WebGl2RenderingContext::MAX_ARRAY_TEXTURE_LAYERS)
+        .unwrap()
+        .as_f64()
+        .unwrap() as u32
+}
+
 /// Vello Hybrid's WebGL2 Renderer.
 #[derive(Debug)]
 pub struct WebGlRenderer {
@@ -82,39 +109,160 @@ pub struct WebGlRenderer {
     programs: WebGlPrograms,
     /// Scheduler for scheduling draws.
     scheduler: Scheduler,
+    /// The state used by the scheduler.
+    scheduler_state: SchedulerState,
     /// WebGL context.
     gl: WebGl2RenderingContext,
-    /// Image cache for storing images atlas allocations.
-    image_cache: ImageCache,
     /// Encoded paints for storing encoded paints.
     encoded_paints: Vec<GpuEncodedPaint>,
     /// Stores the index (offset) of the encoded paints in the encoded paints texture.
     paint_idxs: Vec<u32>,
     /// Gradient cache for storing gradient ramps.
     gradient_cache: GradientRampCache,
+    /// Context for GPU filter effects.
+    filter_context: FilterContext,
+    /// State used for constructing filter passes.
+    filter_pass_state: FilterPassState,
+    dummy_image_cache: Option<ImageCache>,
+}
+
+/// A WebGL probe whose pixel readback has been queued but not completed.
+#[cfg(feature = "probe")]
+#[derive(Debug)]
+pub struct WebGlPendingProbe {
+    gl: WebGl2RenderingContext,
+    sync: Option<WebGlSync>,
+    buffer: Option<WebGlBuffer>,
+    width: u16,
+    height: u16,
+}
+
+/// Error returned while running a WebGL probe.
+#[cfg(feature = "probe")]
+#[derive(Debug, Clone, Error)]
+pub enum WebGlProbeError {
+    /// Rendering the probe scene failed.
+    #[error("probe render failed: {0}")]
+    Render(RenderError),
+    /// Probe readback failed.
+    #[error("probe readback failed")]
+    ReadbackFailed,
+}
+
+/// Result of polling the WebGL probe.
+#[cfg(feature = "probe")]
+#[derive(Debug)]
+pub enum WebGlProbeStatus {
+    /// The probe is still pending.
+    Pending(WebGlPendingProbe),
+    /// The probe has finished and the result is available.
+    Complete(Probe<RenderError>),
+}
+
+#[cfg(feature = "probe")]
+impl WebGlPendingProbe {
+    /// Try to finish the probe.
+    ///
+    /// In case the result is not available yet, a new pending probe object will be returned
+    /// which can be checked again in the future. Otherwise, the probe result or an error will be
+    /// returned.
+    pub fn try_finish(mut self) -> Result<WebGlProbeStatus, WebGlProbeError> {
+        let status = self.gl.client_wait_sync_with_u32(
+            self.sync.as_ref().expect("probe sync must exist"),
+            0,
+            0,
+        );
+
+        if status == WebGl2RenderingContext::TIMEOUT_EXPIRED {
+            return Ok(WebGlProbeStatus::Pending(self));
+        }
+
+        if status == WebGl2RenderingContext::ALREADY_SIGNALED
+            || status == WebGl2RenderingContext::CONDITION_SATISFIED
+        {
+            Ok(WebGlProbeStatus::Complete(self.finish_success()))
+        } else {
+            Err(self.finish_failure())
+        }
+    }
+
+    fn finish_success(&mut self) -> Probe<RenderError> {
+        let _state_guard = WebGlStateGuard::with_config(
+            &self.gl,
+            WebGlStateConfig {
+                pixel_pack_buffer: true,
+                ..Default::default()
+            },
+        );
+        let mut pixmap = Pixmap::new(self.width, self.height);
+
+        self.gl.bind_buffer(
+            WebGl2RenderingContext::PIXEL_PACK_BUFFER,
+            self.buffer.as_ref(),
+        );
+        self.gl.get_buffer_sub_data_with_i32_and_u8_array(
+            WebGl2RenderingContext::PIXEL_PACK_BUFFER,
+            0,
+            pixmap.data_as_u8_slice_mut(),
+        );
+
+        Probe::from_actual(pixmap)
+    }
+
+    fn finish_failure(&mut self) -> WebGlProbeError {
+        WebGlProbeError::ReadbackFailed
+    }
+}
+
+#[cfg(feature = "probe")]
+impl Drop for WebGlPendingProbe {
+    fn drop(&mut self) {
+        if let Some(sync) = self.sync.take() {
+            self.gl.delete_sync(Some(&sync));
+        }
+        if let Some(buffer) = self.buffer.take() {
+            self.gl.delete_buffer(Some(&buffer));
+        }
+    }
 }
 
 impl WebGlRenderer {
     /// Creates a new WebGL2 renderer
-    pub fn new(canvas: &web_sys::HtmlCanvasElement) -> Self {
+    pub fn new(canvas: &HtmlCanvasElement) -> Self {
         Self::new_with(canvas, RenderSettings::default())
     }
 
     /// Creates a new WebGL2 renderer with specific settings.
-    pub fn new_with(canvas: &web_sys::HtmlCanvasElement, settings: RenderSettings) -> Self {
+    pub fn new_with(canvas: &HtmlCanvasElement, settings: RenderSettings) -> Self {
+        #[allow(
+            clippy::assertions_on_constants,
+            reason = "intentional guard against non-wasm32 use"
+        )]
+        {
+            debug_assert!(
+                cfg!(target_arch = "wasm32"),
+                "`WebGlRenderer` can only be constructed when targeting `wasm32`",
+            );
+        }
         super::common::maybe_warn_about_webgl_feature_conflict();
 
-        // The WebGL context must be created with anti-aliasing disabled such that we can blit the
-        // view framebuffer onto the default framebuffer. This technique is required for the code
-        // that converts the WebGPU coordinate system into the WebGL coordinate system, adapted from
-        // the `wgpu` library. The coordinate space is fixed via two steps:
-        //   1. naga adds a coordinate transform to the glsl vertex shaders – however Y axis remains
-        //      flipped.
-        //   2. A view framebuffer is used as an intermediate render target. The final result is
-        //      blit onto the  default framebuffer reflected to fix the flipped Y axis.
-        // Anti-aliasing causes the blit operation to fail.
+        // We do our own anti-aliasing, so no need to enable it in the WebGL
+        // context.
         let context_options = js_sys::Object::new();
         js_sys::Reflect::set(&context_options, &"antialias".into(), &JsValue::FALSE).unwrap();
+        // Vello only supports 24+ bit depth buffers. If the hardware falls back to a 16 bit depth buffer,
+        // correctness issues will arise. For all intents and purposes, a device manufactured in the past 10 years
+        // should support 24+ bit depth buffers (certainly those within the realm of what we consider "supported" devices)
+        // but:
+        //
+        // Relevant code for default depth buffer behaviour can be found here:
+        // - Chromium defaults to 24 bit with no fallback: https://github.com/chromium/chromium/blob/86bafb3aab8e999690d310b201d0b5489f512b08/third_party/blink/renderer/platform/graphics/gpu/drawing_buffer.cc#L1376-L1400
+        // - Firefox defaults to 24 bit with no fallback: https://github.com/mozilla/gecko-dev/blob/5836a062726f715fda621338a17b51aff30d0a8c/gfx/gl/MozFramebuffer.cpp#L155-L161
+        // - Safari defaults to 24 bit _with 16 bit_ fallback: https://github.com/WebKit/WebKit/blob/a6d6c154bbee0643f5ad1e55c071558c0df9aef7/Source/WebCore/platform/graphics/angle/GraphicsContextGLANGLE.cpp#L393-L416
+        //
+        // TODO: The above understanding is encoded in a below assertion, but this should be encapsulated within a
+        // "this device can run Vello correctly" check function.
+        js_sys::Reflect::set(&context_options, &"depth".into(), &JsValue::TRUE).unwrap();
 
         let gl = canvas
             .get_context_with_context_options("webgl2", &context_options)
@@ -123,12 +271,30 @@ impl WebGlRenderer {
             .dyn_into::<WebGl2RenderingContext>()
             .expect("Context to be a WebGL2 context");
 
+        let cloned_gl = gl.clone();
+        let _state_guard = WebGlStateGuard::with_config(
+            &cloned_gl,
+            WebGlStateConfig {
+                framebuffer: true,
+                ..Default::default()
+            },
+        );
+
+        // Note: It is not entirely clear whether we really _have_ to ensure anti-aliasing is disabled.
+        // This code is inherited from a similar snippet in wgpu
+        // (https://github.com/gfx-rs/wgpu/blob/56e4a389ddd02403e232beef3d3ff305625e6485/wgpu-hal/src/gles/web.rs#L101-L106),
+        // which itself seems to have been copied from the older `gfx` crate, where it was first introduced
+        // in https://github.com/gfx-rs/gfx/pull/2554/changes#diff-a47711d61df7a43fe6dd99c39b936d17ff817cbc2238d7e3ae6698ffde9b88f7R79,
+        // without any comment on why.
+        // From my (Laurenz) testing, tests seem to work even when anti-aliasing is enabled,
+        // but Andrew previously got errors similar to the ones outlined in
+        // https://github.com/gfx-rs/wgpu/issues/5263. Therefore, we just leave it as is for now.
         #[cfg(debug_assertions)]
         {
             // If a WebGL context already exists on this canvas, it will be returned instead of
-            // creating a new one with the correct context_options set. A cached context with
-            // antialias enabled will cause vello_hybrid to fail silently. This assertion catches
-            // that error early.
+            // creating a new one with the correct context_options set.
+            // See this comment for why we still care about non-antialiased context:
+            // https://github.com/linebender/vello/pull/1546/changes#r3008692535
             let context_attributes = gl.get_context_attributes().unwrap();
             let antialias = js_sys::Reflect::get(&context_attributes, &"antialias".into())
                 .unwrap()
@@ -140,30 +306,54 @@ impl WebGlRenderer {
             );
         }
 
+        let mut settings = settings;
         let max_texture_dimension_2d = get_max_texture_dimension_2d(&gl);
+        normalize_atlas_config(
+            &mut settings.atlas_config,
+            max_texture_dimension_2d,
+            get_max_texture_array_layers(&gl),
+            1,
+        );
         let total_slots: usize = (max_texture_dimension_2d / u32::from(Tile::HEIGHT)) as usize;
+        assert!(
+            gl.get_parameter(WebGl2RenderingContext::DEPTH_BITS)
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                >= 24.0,
+            "Depth buffer must be at least 24 bits"
+        );
         let image_cache = ImageCache::new_with_config(settings.atlas_config);
         // Estimate the maximum number of gradient cache entries based on the max texture dimension
         // and the maximum gradient LUT size - worst case scenario.
         let max_gradient_cache_size =
             max_texture_dimension_2d * max_texture_dimension_2d / MAX_GRADIENT_LUT_SIZE as u32;
         let gradient_cache = GradientRampCache::new(max_gradient_cache_size, settings.level);
+        let filter_context = FilterContext::new(settings.atlas_config);
 
         Self {
-            programs: WebGlPrograms::new(gl.clone(), &image_cache, total_slots),
+            programs: WebGlPrograms::new(gl.clone(), &image_cache, &filter_context, total_slots),
             scheduler: Scheduler::new(total_slots),
+            scheduler_state: SchedulerState::default(),
             gl,
-            image_cache,
             encoded_paints: Vec::new(),
             paint_idxs: Vec::new(),
             gradient_cache,
+            filter_context,
+            filter_pass_state: FilterPassState::default(),
+            dummy_image_cache: Some(ImageCache::new_dummy()),
         }
     }
 
     /// Render `scene` using WebGL2
     ///
     /// This method creates GPU resources as needed and schedules potentially multiple draw calls.
-    pub fn render(&mut self, scene: &Scene, render_size: &RenderSize) -> Result<(), RenderError> {
+    pub fn render(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        render_size: &RenderSize,
+    ) -> Result<(), RenderError> {
         debug_assert_eq!(
             RenderSize {
                 width: self.gl.drawing_buffer_width() as u32,
@@ -173,7 +363,293 @@ impl WebGlRenderer {
             "Render size must match drawing buffer size"
         );
 
-        self.prepare_gpu_encoded_paints(&scene.encoded_paints);
+        #[cfg(feature = "text")]
+        {
+            resources.before_render(
+                self,
+                |renderer, glyph_renderer, atlas_count, atlas_config, atlas_id| {
+                    renderer
+                        .render_to_atlas(glyph_renderer, atlas_count, atlas_config, atlas_id)
+                        .expect("Failed to render glyphs to atlas");
+                },
+                |renderer, image_cache, upload, dst_x, dst_y| {
+                    renderer.write_to_atlas(
+                        image_cache,
+                        upload.image_id,
+                        &upload.pixmap,
+                        Some([dst_x, dst_y]),
+                    );
+                },
+            );
+        }
+
+        self.render_scene(
+            scene,
+            &mut resources.image_cache,
+            render_size,
+            true,
+            RootRenderTarget::UserSurface,
+        )?;
+
+        #[cfg(feature = "text")]
+        {
+            resources.after_render(self, |renderer, rect| {
+                clear_atlas_region(renderer, rect);
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Render a `scene` directly into an atlas layer.
+    ///
+    /// This renders the scene's content into the specified atlas layer, which can then
+    /// be sampled as an image in subsequent render passes. This is useful for rendering
+    /// vector content (e.g., glyphs) into the atlas for later use as cached images.
+    ///
+    /// The scene should be sized to the atlas layer dimensions
+    /// ([`AtlasConfig::atlas_size`]), with content positioned at the allocated offset
+    /// coordinates from `ImageCache::allocate`.
+    ///
+    /// This method creates its own command encoder and submits immediately,
+    /// ensuring atlas content is committed before any subsequent
+    /// [`render`](Self::render) call (the two methods share GPU resources that
+    /// are staged by `queue.write_*` and only applied on the next `queue.submit`).
+    #[doc(hidden)]
+    pub fn render_to_atlas(
+        &mut self,
+        scene: &Scene,
+        atlas_count: u32,
+        atlas_config: AtlasConfig,
+        atlas_id: AtlasId,
+    ) -> Result<(), RenderError> {
+        self.programs
+            .maybe_resize_atlas_texture_array(&self.gl, atlas_count);
+
+        let (atlas_width, atlas_height) = atlas_config.atlas_size;
+        let atlas_render_size = RenderSize {
+            width: atlas_width,
+            height: atlas_height,
+        };
+
+        let atlas_framebuffer = self
+            .programs
+            .resources
+            .atlas_render_framebuffer
+            .take()
+            .unwrap_or_else(|| Framebuffer::new(&self.gl));
+        self.gl.bind_framebuffer(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            Some(&atlas_framebuffer),
+        );
+        self.gl.framebuffer_texture_layer(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::COLOR_ATTACHMENT0,
+            Some(&self.programs.resources.atlas_texture_array.texture),
+            0,
+            atlas_id.as_u32() as i32,
+        );
+
+        // Set the view framebuffer override so the scheduler renders to the
+        // atlas layer instead of the default framebuffer.
+        self.programs.resources.view_framebuffer_override = Some(atlas_framebuffer);
+
+        // Swap in the stub atlas texture array to avoid binding the real atlas
+        // texture as a shader input while it is also the render target.
+        core::mem::swap(
+            &mut self.programs.resources.atlas_texture_array,
+            &mut self.programs.resources.stub_atlas_texture_array,
+        );
+
+        // TODO: Explore using an option instead of a dummy image cache.
+        let mut dummy_image_cache = self
+            .dummy_image_cache
+            .take()
+            .expect("dummy image cache must exist");
+        let result = self.render_scene(
+            scene,
+            &mut dummy_image_cache,
+            &atlas_render_size,
+            false,
+            RootRenderTarget::AtlasLayer,
+        );
+        self.dummy_image_cache = Some(dummy_image_cache);
+
+        // Restore the real atlas texture array.
+        core::mem::swap(
+            &mut self.programs.resources.atlas_texture_array,
+            &mut self.programs.resources.stub_atlas_texture_array,
+        );
+
+        // Restore the default view framebuffer and cache the atlas FBO for reuse.
+        self.programs.resources.atlas_render_framebuffer =
+            self.programs.resources.view_framebuffer_override.take();
+
+        result
+    }
+
+    /// Conduct a probing operation.
+    ///
+    /// The WebGL drivers of certain devices are known to be buggy and might therefore not work correctly
+    /// with Vello Hybrid. In the best case, it will simply result in a program crash, but in the worst
+    /// case it can instead result in a silent failure, meaning that no explicit error is
+    /// thrown, but the rendered contents of Vello Hybrid will either be completely empty or look glitchy.
+    ///
+    /// The purpose of this method is to run a sanity check to ensure that running Vello Hybrid on this
+    /// device actually results in visible and correct output. How this achieved is by drawing a selection
+    /// of small elements into a small canvas, and comparing the final output against a reference image.
+    ///
+    /// This method will return a handle that allows inspecting the results of the probe once the
+    /// results of the probe scene can be copied back from GPU to CPU. For performance reasons,
+    /// anything in-between mostly happens asynchronously.
+    #[cfg(feature = "probe")]
+    pub fn probe(&mut self) -> Result<WebGlPendingProbe, WebGlProbeError> {
+        self.probe_inner().map_err(WebGlProbeError::Render)
+    }
+
+    #[cfg(feature = "probe")]
+    fn probe_inner(&mut self) -> Result<WebGlPendingProbe, RenderError> {
+        // IMPORTANT NOTE: When making any changes to the probe, make sure to
+        // unignore and rerun the "webgl_probe_succeeds" test locally.
+
+        let _state_guard = WebGlStateGuard::with_config(
+            &self.gl,
+            WebGlStateConfig {
+                framebuffer: true,
+                active_texture: true,
+                texture_2d: true,
+                texture_2d_array: true,
+                pixel_pack_buffer: true,
+                viewport: true,
+                ..Default::default()
+            },
+        );
+
+        let (width, height) = vello_common::probe::canvas_size();
+        let render_size = RenderSize {
+            width: u32::from(width),
+            height: u32::from(height),
+        };
+
+        let probe_texture = create_texture(&self.gl);
+        self.gl
+            .tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+                WebGl2RenderingContext::TEXTURE_2D,
+                0,
+                WebGl2RenderingContext::RGBA8 as i32,
+                render_size.width as i32,
+                render_size.height as i32,
+                0,
+                WebGl2RenderingContext::RGBA,
+                WebGl2RenderingContext::UNSIGNED_BYTE,
+                None,
+            )
+            .unwrap();
+        let probe_framebuffer = create_framebuffer_for_texture(&self.gl, &probe_texture);
+
+        let atlas_config = AtlasConfig {
+            initial_atlas_count: 1,
+            // These should be large enough for the probe scene.
+            atlas_size: (256, 256),
+            max_atlases: 1,
+            auto_grow: true,
+            allocation_strategy: AllocationStrategy::FirstFit,
+        };
+        let (atlas_width, atlas_height) = atlas_config.atlas_size;
+
+        let mut probe_image_cache = ImageCache::new_with_config(atlas_config);
+        let mut probe_atlas_texture_array =
+            create_atlas_texture_array(&self.gl, atlas_width, atlas_height, 1);
+        core::mem::swap(
+            &mut self.programs.resources.atlas_texture_array,
+            &mut probe_atlas_texture_array,
+        );
+
+        let probe_image = Arc::new(vello_common::probe::probe_image_pixmap());
+        // Note: No need to destroy the image explicitly in the end, because we discard the image
+        // cache anyway.
+        let probe_image_id =
+            self.upload_image_with(&mut probe_image_cache, &probe_image, IMAGE_PADDING);
+        let mut scene = Scene::new(width, height);
+        vello_common::probe::draw_scene(
+            &mut scene,
+            ImageSource::opaque_id_with_transparency_hint(
+                probe_image_id,
+                probe_image.may_have_transparency(),
+            ),
+        );
+
+        let previous_view_framebuffer = self
+            .programs
+            .resources
+            .view_framebuffer_override
+            .replace(probe_framebuffer);
+        let render_result = self.render_scene(
+            &scene,
+            &mut probe_image_cache,
+            &render_size,
+            true,
+            RootRenderTarget::AtlasLayer,
+        );
+        let probe_framebuffer = self
+            .programs
+            .resources
+            .view_framebuffer_override
+            .take()
+            .expect("probe framebuffer must be restored after rendering");
+        self.programs.resources.view_framebuffer_override = previous_view_framebuffer;
+
+        core::mem::swap(
+            &mut self.programs.resources.atlas_texture_array,
+            &mut probe_atlas_texture_array,
+        );
+
+        // We do this here instead of above such that in case the render result is not
+        // valid, we still properly restore the state (e.g. the old atlas texture array).
+        render_result?;
+
+        let pending = launch_probe(&self.gl, &probe_framebuffer, width, height);
+
+        Ok(pending)
+    }
+
+    /// Shared render pipeline: prepares GPU resources, runs the scheduler, and
+    /// maintains caches.
+    ///
+    /// When `clear` is true the view framebuffer is cleared to transparent black
+    /// before drawing. This must happen *after* `prepare` (which may create/resize
+    /// the framebuffer attachment). Atlas renders skip the clear so previously
+    /// rendered atlas content is preserved.
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        image_cache: &mut ImageCache,
+        render_size: &RenderSize,
+        clear: bool,
+        root_output_target: RootRenderTarget,
+    ) -> Result<(), RenderError> {
+        if !self.filter_context.filter_textures.is_empty() {
+            self.programs.clear_filter_atlas_textures(&self.gl);
+        }
+
+        self.filter_context
+            .deallocate_all_and_clear_context(image_cache);
+
+        let mut encoded_paints = scene.encoded_paints.borrow_mut();
+        let original_scene_paint_count = encoded_paints.len();
+
+        self.filter_context
+            .prepare(&scene.render_graph, image_cache, &mut encoded_paints)?;
+
+        self.prepare_gpu_encoded_paints(&encoded_paints, image_cache);
+
+        self.programs
+            .maybe_resize_atlas_texture_array(&self.gl, image_cache.atlas_count() as u32);
+        self.programs.maybe_resize_filter_atlas_textures(
+            &self.gl,
+            self.filter_context.image_cache.atlas_count() as u32,
+        );
+
         // TODO: For the time being, we upload the entire alpha buffer as one big chunk. As a future
         // refinement, we could have a bounded alpha buffer, and break draws when the alpha
         // buffer fills.
@@ -181,74 +657,52 @@ impl WebGlRenderer {
             &self.gl,
             &mut self.gradient_cache,
             &self.encoded_paints,
-            &scene.strip_storage.alphas,
+            &mut scene.strip_storage.borrow_mut().alphas,
             render_size,
             &self.paint_idxs,
+            &self.filter_context,
         );
+
+        if clear {
+            self.programs.clear_view_framebuffer(&self.gl);
+        }
+        self.programs.resources.depth_cleared_this_frame = false;
         let mut ctx = WebGlRendererContext {
             programs: &mut self.programs,
             gl: &self.gl,
+            image_cache,
+            filter_context: &self.filter_context,
+            filter_pass_state: &mut self.filter_pass_state,
         };
-        self.scheduler.do_scene(&mut ctx, scene, &self.paint_idxs)?;
+        self.scheduler.do_scene(
+            &mut self.scheduler_state,
+            &mut ctx,
+            scene,
+            root_output_target,
+            &self.paint_idxs,
+            &self.filter_context,
+            &encoded_paints,
+        )?;
+
+        // See: https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#use_invalidateframebuffer
+        // We want to indicate to the GPU driver that we won't read the depth buffer again
+        // until the next clear. This enables the GPU to avoid storing depth tiles back to VRAM.
+        if self.programs.resources.depth_cleared_this_frame {
+            self.gl.bind_framebuffer(
+                WebGl2RenderingContext::FRAMEBUFFER,
+                self.programs.resources.view_framebuffer_override.as_deref(),
+            );
+            self.gl
+                .invalidate_framebuffer(
+                    WebGl2RenderingContext::FRAMEBUFFER,
+                    &self.programs.resources.depth_attachment_array,
+                )
+                .unwrap();
+        }
+
+        encoded_paints.truncate(original_scene_paint_count);
         self.gradient_cache.maintain();
 
-        // Blit the view framebuffer to the default framebuffer (canvas element), reflecting the
-        // image along the Y axis to complete the WebGPU to WebGL2 coordinate transform.
-        self.gl.bind_framebuffer(
-            WebGl2RenderingContext::READ_FRAMEBUFFER,
-            Some(&self.programs.resources.view_framebuffer),
-        );
-        #[cfg(debug_assertions)]
-        {
-            let status = self
-                .gl
-                .check_framebuffer_status(WebGl2RenderingContext::READ_FRAMEBUFFER);
-            debug_assert_eq!(
-                status,
-                WebGl2RenderingContext::FRAMEBUFFER_COMPLETE,
-                "read framebuffer not complete"
-            );
-        }
-
-        self.gl
-            .bind_framebuffer(WebGl2RenderingContext::DRAW_FRAMEBUFFER, None);
-
-        #[cfg(debug_assertions)]
-        {
-            let status = self
-                .gl
-                .check_framebuffer_status(WebGl2RenderingContext::DRAW_FRAMEBUFFER);
-            debug_assert_eq!(
-                status,
-                WebGl2RenderingContext::FRAMEBUFFER_COMPLETE,
-                "write framebuffer not complete"
-            );
-        }
-
-        self.gl.blit_framebuffer(
-            0,
-            render_size.height as i32,
-            render_size.width as i32,
-            0,
-            0,
-            0,
-            render_size.width as i32,
-            render_size.height as i32,
-            WebGl2RenderingContext::COLOR_BUFFER_BIT,
-            WebGl2RenderingContext::LINEAR,
-        );
-
-        #[cfg(debug_assertions)]
-        {
-            // `get_error` cause synchronous stalls on the calling thread. It's best practice in
-            // release to omit this call.
-            // Reference:
-            //   https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API/WebGL_best_practices#avoid_blocking_api_calls_in_production
-            let error = self.gl.get_error();
-            if error != WebGl2RenderingContext::NO_ERROR {
-                panic!("WebGL error {error}");
-            }
-        }
         Ok(())
     }
 
@@ -265,54 +719,88 @@ impl WebGlRenderer {
     /// It allocates space in the image cache and uploads the image data to the atlas texture.
     pub fn upload_image<T: WebGlAtlasWriter>(
         &mut self,
+        resources: &mut Resources,
         writer: &T,
-    ) -> vello_common::paint::ImageId {
+    ) -> ImageId {
+        self.upload_image_with(&mut resources.image_cache, writer, IMAGE_PADDING)
+    }
+
+    pub(crate) fn upload_image_with<T: WebGlAtlasWriter>(
+        &mut self,
+        image_cache: &mut ImageCache,
+        writer: &T,
+        padding: u16,
+    ) -> ImageId {
         let width = writer.width();
         let height = writer.height();
-        let image_id = self.image_cache.allocate(width, height).unwrap();
-        let image_resource = self
-            .image_cache
-            .get(image_id)
-            .expect("Image resource not found");
+        let image_id = image_cache.allocate(width, height, padding).unwrap();
+        self.write_to_atlas(image_cache, image_id, writer, None);
+        image_id
+    }
+
+    /// Write pixel data to an existing atlas allocation.
+    ///
+    /// Unlike [`upload_image`](Self::upload_image), this does not allocate space in the image
+    /// cache. The `image_id` must have been previously allocated (e.g. via
+    /// `ImageCache::allocate`). This is useful for uploading CPU-side pixel data (such as
+    /// bitmap font glyphs) to a pre-allocated atlas region.
+    ///
+    /// If `offset_override` is `Some`, the provided offset is used instead of the
+    /// allocator-assigned position. Pass `None` to use the default atlas offset.
+    pub(crate) fn write_to_atlas<T: WebGlAtlasWriter>(
+        &mut self,
+        image_cache: &ImageCache,
+        image_id: ImageId,
+        writer: &T,
+        offset_override: Option<[u32; 2]>,
+    ) {
+        let image_resource = image_cache.get(image_id).expect("Image resource not found");
 
         self.programs
-            .maybe_resize_atlas_texture_array(&self.gl, self.image_cache.atlas_count() as u32);
-        let offset = [
+            .maybe_resize_atlas_texture_array(&self.gl, image_cache.atlas_count() as u32);
+        let offset = offset_override.unwrap_or([
             image_resource.offset[0] as u32,
             image_resource.offset[1] as u32,
-        ];
-        // Write to the appropriate layer in the atlas texture array
+        ]);
         writer.write_to_atlas_layer(
             &self.gl,
             &self.programs.resources.atlas_texture_array.texture,
             image_resource.atlas_id.as_u32(),
             offset,
-            width,
-            height,
+            writer.width(),
+            writer.height(),
         );
-
-        image_id
     }
 
     /// Destroy an image from the cache and clear the allocated slot in the atlas.
-    pub fn destroy_image(&mut self, image_id: vello_common::paint::ImageId) {
-        if let Some(image_resource) = self.image_cache.deallocate(image_id) {
+    pub fn destroy_image(&mut self, resources: &mut Resources, image_id: ImageId) {
+        if let Some(image_resource) = resources.image_cache.deallocate(image_id) {
+            let padding = image_resource.padding as u32;
             self.clear_atlas_region(
                 image_resource.atlas_id,
                 [
-                    image_resource.offset[0] as u32,
-                    image_resource.offset[1] as u32,
+                    image_resource.offset[0] as u32 - padding,
+                    image_resource.offset[1] as u32 - padding,
                 ],
-                image_resource.width as u32,
-                image_resource.height as u32,
+                image_resource.width as u32 + padding * 2,
+                image_resource.height as u32 + padding * 2,
             );
         }
+    }
+
+    /// Returns a reference to the underlying atlas texture array.
+    ///
+    /// This is a 2D array texture (`TextureViewDimension::D2Array`) containing all
+    /// atlas layers used by the image cache. Each layer holds cached image data
+    /// (e.g., rasterised glyphs) that the renderer samples during draw calls.
+    pub fn atlas_texture(&self) -> &WebGlTexture {
+        &self.programs.resources.atlas_texture_array.texture
     }
 
     /// Clear a specific region of the atlas texture array.
     fn clear_atlas_region(&mut self, atlas_id: AtlasId, offset: [u32; 2], width: u32, height: u32) {
         let _state_guard = WebGlStateGuard::for_clear_atlas_region(&self.gl);
-        let temp_framebuffer = self.gl.create_framebuffer().unwrap();
+        let temp_framebuffer = Framebuffer::new(&self.gl);
 
         // Bind our temporary framebuffer
         self.gl
@@ -344,12 +832,13 @@ impl WebGlRenderer {
         // Clear the region to transparent (0, 0, 0, 0)
         self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
         self.gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
-
-        // Clean up temporary framebuffer
-        self.gl.delete_framebuffer(Some(&temp_framebuffer));
     }
 
-    fn prepare_gpu_encoded_paints(&mut self, encoded_paints: &[EncodedPaint]) {
+    fn prepare_gpu_encoded_paints(
+        &mut self,
+        encoded_paints: &[EncodedPaint],
+        image_cache: &ImageCache,
+    ) {
         self.encoded_paints
             .resize_with(encoded_paints.len(), || GPU_PAINT_PLACEHOLDER);
         self.paint_idxs.resize(encoded_paints.len() + 1, 0);
@@ -359,8 +848,8 @@ impl WebGlRenderer {
             self.paint_idxs[encoded_paint_idx] = current_idx;
             match paint {
                 EncodedPaint::Image(img) => {
-                    if let ImageSource::OpaqueId(image_id) = img.source {
-                        let image_resource: Option<&ImageResource> = self.image_cache.get(image_id);
+                    if let ImageSource::OpaqueId { id: image_id, .. } = img.source {
+                        let image_resource: Option<&ImageResource> = image_cache.get(image_id);
                         if let Some(image_resource) = image_resource {
                             let gpu_image = self.encode_image_paint(img, image_resource);
                             self.encoded_paints[encoded_paint_idx] = gpu_image;
@@ -382,11 +871,15 @@ impl WebGlRenderer {
                     self.encoded_paints[encoded_paint_idx] = gpu_gradient;
                     current_idx += gradient_size_texels;
                 }
-                EncodedPaint::BlurredRoundedRect(_blurred_rect) => {
-                    // TODO: Blurred rounded rectangles are not yet supported
-                    log::warn!(
-                        "Blurred rounded rectangles are not yet supported in sparse strips hybrid renderer"
-                    );
+                EncodedPaint::ExternalTexture(_external_texture) => {
+                    // TODO: External textures are not yet supported.
+                    log::warn!("External textures are not yet supported in the WebGL backend");
+                    current_idx += GPU_ENCODED_IMAGE_SIZE_TEXELS;
+                }
+                EncodedPaint::BlurredRoundedRect(blurred_rect) => {
+                    self.encoded_paints[encoded_paint_idx] =
+                        Self::encode_blurred_rounded_rect_paint(blurred_rect);
+                    current_idx += GPU_BLURRED_ROUNDED_RECT_SIZE_TEXELS;
                 }
             }
         }
@@ -398,8 +891,7 @@ impl WebGlRenderer {
         image: &vello_common::encode::EncodedImage,
         image_resource: &ImageResource,
     ) -> GpuEncodedPaint {
-        let image_transform = image.transform * Affine::translate((-0.5, -0.5));
-        let transform = image_transform.as_coeffs().map(|x| x as f32);
+        let transform = image.transform.as_coeffs().map(|x| x as f32);
         let image_size = pack_image_size(image_resource.width, image_resource.height);
         let image_offset = pack_image_offset(image_resource.offset[0], image_resource.offset[1]);
         let image_params = pack_image_params(
@@ -408,13 +900,16 @@ impl WebGlRenderer {
             image.sampler.y_extend as u32,
             image_resource.atlas_id.as_u32(),
         );
+        let (tint, tint_mode) = pack_tint(image.tint);
 
         GpuEncodedPaint::Image(GpuEncodedImage {
             image_params,
             image_size,
             image_offset,
             transform,
-            _padding: [0, 0, 0],
+            tint,
+            tint_mode,
+            image_padding: image_resource.padding as u32,
         })
     }
 
@@ -424,8 +919,7 @@ impl WebGlRenderer {
         gradient_width: u32,
         gradient_start: u32,
     ) -> GpuEncodedPaint {
-        let gradient_transform = gradient.transform * Affine::translate((-0.5, -0.5));
-        let transform = gradient_transform.as_coeffs().map(|x| x as f32);
+        let transform = gradient.transform.as_coeffs().map(|x| x as f32);
         let extend_mode = match gradient.extend {
             peniko::Extend::Pad => 0,
             peniko::Extend::Repeat => 1,
@@ -489,27 +983,71 @@ impl WebGlRenderer {
             }),
         }
     }
+
+    fn encode_blurred_rounded_rect_paint(rect: &EncodedBlurredRoundedRectangle) -> GpuEncodedPaint {
+        GpuEncodedPaint::BlurredRoundedRect(GpuBlurredRoundedRect {
+            transform: rect.transform.as_coeffs().map(|x| x as f32),
+            color: rect.color.as_premul_rgba8().to_u32(),
+            invert: u32::from(rect.invert),
+            params0: [
+                rect.exponent,
+                rect.recip_exponent,
+                rect.scale,
+                rect.std_dev_inv,
+            ],
+            params1: [rect.min_edge, rect.w, rect.h, rect.r1],
+            size: [rect.width, rect.height],
+            _padding1: [0, 0],
+        })
+    }
+}
+
+#[cfg(feature = "text")]
+fn clear_atlas_region(renderer: &mut WebGlRenderer, rect: &PendingClearRect) {
+    // TODO: Similarly to wgpu, maybe this can be done in a more effective
+    // way?
+    let padding = u32::from(GLYPH_PADDING);
+    let offset = [
+        u32::from(rect.x).saturating_sub(padding),
+        u32::from(rect.y).saturating_sub(padding),
+    ];
+    let width = u32::from(rect.width) + padding * 2;
+    let height = u32::from(rect.height) + padding * 2;
+    renderer.clear_atlas_region(AtlasId::new(rect.page_index), offset, width, height);
 }
 
 /// Contains the WebGL programs and resources for rendering.
 #[derive(Debug)]
 struct WebGlPrograms {
     /// Program for rendering wide tile commands.
-    strip_program: WebGlProgram,
+    strip_program: Program,
     /// Uniform locations for the strip program
     strip_uniforms: StripUniforms,
     /// Program for clearing slots in slot textures.
-    clear_program: WebGlProgram,
+    clear_program: Program,
     /// Uniform locations for the `clear_program`.
     clear_uniforms: ClearUniforms,
+    /// Program for filter passes.
+    filter_program: Program,
+    /// Uniform locations for the filter program.
+    filter_uniforms: FilterPassUniforms,
     /// WebGL resources for rendering.
     resources: WebGlResources,
     /// Dimensions of the rendering target.
     render_size: RenderSize,
-    /// Scratch buffer for staging alpha texture data.
-    alpha_data: Vec<u8>,
+    /// Whether the last config buffer upload had NDC Y negation enabled.
+    negate_ndc: bool,
     /// Scratch buffer for staging encoded paints texture data.
     encoded_paints_data: Vec<u8>,
+    /// Scratch buffer for staging filter data texture data.
+    filter_data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct FilterPassUniforms {
+    filter_data: WebGlUniformLocation,
+    in_tex: WebGlUniformLocation,
+    original_tex: WebGlUniformLocation,
 }
 
 /// Uniform locations for `strip_program`.
@@ -531,6 +1069,8 @@ struct StripUniforms {
     encoded_paints_texture_vs: WebGlUniformLocation,
     /// Gradient texture location.
     gradient_texture: WebGlUniformLocation,
+    /// External texture location.
+    external_texture: WebGlUniformLocation,
 }
 
 /// Uniform locations for `clear_program`.
@@ -544,49 +1084,83 @@ struct ClearUniforms {
 #[derive(Debug)]
 struct WebGlResources {
     /// VAO for strip rendering.
-    strip_vao: WebGlVertexArrayObject,
+    strip_vao: VertexArray,
     /// Buffer for [`GpuStrip`] data.
-    strips_buffer: WebGlBuffer,
+    strips_buffer: Buffer,
     /// Texture for alpha values (used by both view and slot rendering).
-    alphas_texture: WebGlTexture,
+    alphas_texture: Texture,
     /// Height of alpha texture.
     alpha_texture_height: u32,
     /// Texture array for atlas data (multiple atlases supported)
     atlas_texture_array: WebGlTextureArray,
     /// Encoded paints texture for image metadata.
-    encoded_paints_texture: WebGlTexture,
+    encoded_paints_texture: Texture,
     /// Height of encoded paints texture.
     encoded_paints_texture_height: u32,
     /// Gradient texture for gradient ramp data.
-    gradient_texture: WebGlTexture,
+    gradient_texture: Texture,
+    /// Placeholder texture bound to the strip shader's `external_texture` sampler.
+    placeholder_external_texture: Texture,
     /// Height of gradient texture.
     gradient_texture_height: u32,
 
     /// Config buffer for rendering wide tile commands into the view texture.
-    view_config_buffer: WebGlBuffer,
+    view_config_buffer: Buffer,
     /// Config buffer for rendering wide tile commands into a slot texture.
-    slot_config_buffer: WebGlBuffer,
+    slot_config_buffer: Buffer,
 
     /// Buffer for slot indices used in `clear_slots`.
-    clear_slot_indices_buffer: WebGlBuffer,
+    clear_slot_indices_buffer: Buffer,
     /// VAO for clear slots program.
-    clear_vao: WebGlVertexArrayObject,
+    clear_vao: VertexArray,
     /// Config buffer for clear program.
-    clear_config_buffer: WebGlBuffer,
+    clear_config_buffer: Buffer,
 
-    /// Intermediate surface texture for the main view.
-    view_texture: WebGlTexture,
-    /// Framebuffer for the vfiew texture.
-    view_framebuffer: WebGlFramebuffer,
+    view_framebuffer_override: Option<Framebuffer>,
+    /// Whether the depth buffer has been cleared this frame.
+    depth_cleared_this_frame: bool,
+    /// Pre-allocated JS array for `invalidateFramebuffer` calls.
+    depth_attachment_array: js_sys::Array,
 
     /// Slot textures.
-    slot_textures: [WebGlTexture; 2],
+    slot_textures: [Texture; 2],
     /// Framebuffers for slot textures.
-    slot_framebuffers: [WebGlFramebuffer; 2],
+    slot_framebuffers: [Framebuffer; 2],
 
     /// Cached result from querying `WebGl2RenderingContext::MAX_TEXTURE_SIZE` which is a blocking
     /// WebGL call.
     max_texture_dimension_2d: u32,
+
+    /// Placeholder 1x1 atlas texture array, used during `render_to_atlas` to avoid
+    /// binding the real atlas texture while it is also the render target.
+    stub_atlas_texture_array: WebGlTextureArray,
+
+    /// Cached framebuffer for rendering into an atlas layer in `render_to_atlas`.
+    /// Reused to avoid create/delete overhead on every call.
+    atlas_render_framebuffer: Option<Framebuffer>,
+
+    /// Cached framebuffer for filter passes that write back to the main atlas.
+    /// Reused to avoid create/delete overhead on every filter application.
+    filter_main_atlas_framebuffer: Option<Framebuffer>,
+
+    /// Individual 2D textures for filter intermediate results.
+    filter_atlas_textures: Vec<Texture>,
+    /// Framebuffers for each filter atlas texture.
+    filter_atlas_framebuffers: Vec<Framebuffer>,
+    /// RGBA32UI texture storing filter parameters.
+    filter_data_texture: Texture,
+    /// Current height of filter data texture.
+    filter_data_texture_height: u32,
+    /// Per-instance vertex data buffer for filter draws.
+    filter_instance_buffer: Buffer,
+    /// VAO for filter rendering.
+    filter_vao: VertexArray,
+    /// Config buffer for rendering filter layers.
+    filter_config_buffer: Buffer,
+    /// Cached atlas width for creating new filter atlas textures.
+    filter_atlas_width: u32,
+    /// Cached atlas height for creating new filter atlas textures.
+    filter_atlas_height: u32,
 }
 
 /// Config for the clear slots pipeline.
@@ -605,7 +1179,12 @@ struct ClearSlotsConfig {
 
 impl WebGlPrograms {
     /// Creates programs and initializes resources.
-    fn new(gl: WebGl2RenderingContext, image_cache: &ImageCache, slot_count: usize) -> Self {
+    fn new(
+        gl: WebGl2RenderingContext,
+        image_cache: &ImageCache,
+        filter_context: &FilterContext,
+        slot_count: usize,
+    ) -> Self {
         let strip_program = create_shader_program(
             &gl,
             render_strips::VERTEX_SOURCE,
@@ -616,16 +1195,19 @@ impl WebGlPrograms {
             clear_slots::VERTEX_SOURCE,
             clear_slots::FRAGMENT_SOURCE,
         );
+        let filter_program =
+            create_shader_program(&gl, filters::VERTEX_SOURCE, filters::FRAGMENT_SOURCE);
+        let filter_uniforms = get_filter_pass_uniforms(&gl, &filter_program);
 
         let strip_uniforms = get_strip_uniforms(&gl, &strip_program);
         let clear_uniforms = get_clear_uniforms(&gl, &clear_program);
 
-        let resources = create_webgl_resources(&gl, image_cache, slot_count);
+        let resources = create_webgl_resources(&gl, image_cache, filter_context, slot_count);
 
         initialize_strip_vao(&gl, &resources);
         initialize_clear_vao(&gl, &resources);
+        initialize_filter_vao(&gl, &resources);
 
-        let alpha_data = vec![0; (resources.max_texture_dimension_2d << 4) as usize];
         let encoded_paints_data = vec![0; (resources.max_texture_dimension_2d << 4) as usize];
 
         gl.enable(WebGl2RenderingContext::BLEND);
@@ -637,6 +1219,8 @@ impl WebGlPrograms {
         Self {
             strip_program,
             clear_program,
+            filter_program,
+            filter_uniforms,
             strip_uniforms,
             clear_uniforms,
             resources,
@@ -644,8 +1228,9 @@ impl WebGlPrograms {
                 width: 0,
                 height: 0,
             },
-            alpha_data,
+            negate_ndc: false,
             encoded_paints_data,
+            filter_data: Vec::new(),
         }
     }
 
@@ -655,26 +1240,27 @@ impl WebGlPrograms {
         gl: &WebGl2RenderingContext,
         gradient_cache: &mut GradientRampCache,
         encoded_paints: &[GpuEncodedPaint],
-        alphas: &[u8],
+        alphas: &mut Vec<u8>,
         render_size: &RenderSize,
         paint_idxs: &[u32],
+        filter_context: &FilterContext,
     ) {
         let max_texture_dimension_2d = self.resources.max_texture_dimension_2d;
 
-        self.maybe_resize_alphas_tex(max_texture_dimension_2d, alphas);
+        self.maybe_resize_alphas_tex(max_texture_dimension_2d, alphas.len());
         self.maybe_resize_encoded_paints_tex(max_texture_dimension_2d, paint_idxs);
+        self.maybe_resize_filter_data_tex(filter_context);
         self.maybe_update_config_buffer(gl, max_texture_dimension_2d, render_size);
 
         self.upload_alpha_texture(gl, alphas);
         self.upload_encoded_paints_texture(gl, encoded_paints);
+        self.upload_filter_data_texture(gl, filter_context);
 
         if gradient_cache.has_changed() {
             self.maybe_resize_gradient_tex(gl, max_texture_dimension_2d, gradient_cache);
             self.upload_gradient_texture(gl, gradient_cache);
             gradient_cache.mark_synced();
         }
-
-        self.clear_view_framebuffer(gl);
     }
 
     /// Resize atlas texture array to accommodate more atlases.
@@ -698,6 +1284,9 @@ impl WebGlPrograms {
 
             // Replace the old resources
             self.resources.atlas_texture_array = new_atlas_texture_array;
+            // Cached FBOs were attached to the old texture; drop them so we recreate on next use.
+            self.resources.atlas_render_framebuffer = None;
+            self.resources.filter_main_atlas_framebuffer = None;
         }
     }
 
@@ -733,9 +1322,113 @@ impl WebGlPrograms {
         }
     }
 
+    fn maybe_resize_filter_data_tex(&mut self, filter_context: &FilterContext) {
+        let max_texture_dimension_2d = self.resources.max_texture_dimension_2d;
+
+        let Some(required_height) =
+            filter_context.required_filter_data_height(max_texture_dimension_2d)
+        else {
+            return;
+        };
+
+        if required_height > self.resources.filter_data_texture_height {
+            let required_size = (max_texture_dimension_2d * required_height) << 4;
+            self.filter_data.resize(required_size as usize, 0);
+            self.resources.filter_data_texture_height = required_height;
+        }
+    }
+
+    fn upload_filter_data_texture(
+        &mut self,
+        gl: &WebGl2RenderingContext,
+        filter_context: &FilterContext,
+    ) {
+        if filter_context.is_empty() {
+            return;
+        }
+
+        let width = self.resources.max_texture_dimension_2d;
+        let height = self.resources.filter_data_texture_height;
+        filter_context.serialize_to_buffer(&mut self.filter_data);
+        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        gl.bind_texture(
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&self.resources.filter_data_texture),
+        );
+        let data_as_u32 = bytemuck::cast_slice::<u8, u32>(&self.filter_data);
+        let packed_array = js_sys::Uint32Array::from(data_as_u32);
+        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+            WebGl2RenderingContext::TEXTURE_2D,
+            0,
+            WebGl2RenderingContext::RGBA32UI as i32,
+            width as i32,
+            height as i32,
+            0,
+            WebGl2RenderingContext::RGBA_INTEGER,
+            WebGl2RenderingContext::UNSIGNED_INT,
+            Some(&packed_array),
+        )
+        .unwrap();
+    }
+
+    fn maybe_resize_filter_atlas_textures(
+        &mut self,
+        gl: &WebGl2RenderingContext,
+        required_count: u32,
+    ) {
+        let current_count = self.resources.filter_atlas_textures.len() as u32;
+        // TODO: Same as wgpu, should we be destroying
+        // textures if they aren't needed anymore?
+        if required_count > current_count {
+            let width = self.resources.filter_atlas_width;
+            let height = self.resources.filter_atlas_height;
+            for _ in current_count..required_count {
+                let tex = create_filter_atlas_texture(gl, width, height);
+                let fb = create_framebuffer_for_texture(gl, &tex);
+                self.resources.filter_atlas_textures.push(tex);
+                self.resources.filter_atlas_framebuffers.push(fb);
+            }
+        }
+    }
+
+    fn clear_filter_atlas_textures(&self, gl: &WebGl2RenderingContext) {
+        let _state_guard = WebGlStateGuard::with_config(
+            gl,
+            WebGlStateConfig {
+                framebuffer: true,
+                viewport: true,
+                ..Default::default()
+            },
+        );
+        let width = self.resources.filter_atlas_width;
+        let height = self.resources.filter_atlas_height;
+        for fb in &self.resources.filter_atlas_framebuffers {
+            gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(fb));
+            gl.viewport(0, 0, width as i32, height as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+        }
+    }
+
+    fn upload_filter_instances(
+        &self,
+        gl: &WebGl2RenderingContext,
+        instances: &[FilterInstanceData],
+    ) {
+        gl.bind_buffer(
+            WebGl2RenderingContext::ARRAY_BUFFER,
+            Some(&self.resources.filter_instance_buffer),
+        );
+        gl.buffer_data_with_u8_array(
+            WebGl2RenderingContext::ARRAY_BUFFER,
+            bytemuck::cast_slice(instances),
+            WebGl2RenderingContext::DYNAMIC_DRAW,
+        );
+    }
+
     /// Update the alpha texture size if needed.
-    fn maybe_resize_alphas_tex(&mut self, max_texture_dimension_2d: u32, alphas: &[u8]) {
-        let required_alpha_height = (alphas.len() as u32)
+    fn maybe_resize_alphas_tex(&mut self, max_texture_dimension_2d: u32, alphas_len: usize) {
+        let required_alpha_height = (alphas_len as u32)
             // There are 16 1-byte alpha values per texel.
             .div_ceil(max_texture_dimension_2d << 4);
 
@@ -746,10 +1439,6 @@ impl WebGlPrograms {
                 required_alpha_height <= max_texture_dimension_2d,
                 "Alpha texture height exceeds max texture dimensions"
             );
-
-            // Resize the alpha texture staging buffer.
-            let required_alpha_size = (max_texture_dimension_2d * required_alpha_height) << 4;
-            self.alpha_data.resize(required_alpha_size as usize, 0);
 
             // Track the new height.
             self.resources.alpha_texture_height = required_alpha_height;
@@ -813,7 +1502,13 @@ impl WebGlPrograms {
         max_texture_dimension_2d: u32,
         new_render_size: &RenderSize,
     ) {
-        if self.render_size != *new_render_size {
+        // Only negate if we are rendering to the main frame buffer.
+        let negate_ndc = self.resources.view_framebuffer_override.is_none();
+
+        // TODO: Collect all attributes that influence the config buffer into a
+        // single struct and compare that, such that we cannot forget to update the
+        // condition in case we add new fields in the future.
+        if self.render_size != *new_render_size || self.negate_ndc != negate_ndc {
             // Update view config buffer
             {
                 let config = Config {
@@ -821,6 +1516,10 @@ impl WebGlPrograms {
                     height: new_render_size.height,
                     strip_height: u32::from(Tile::HEIGHT),
                     alphas_tex_width_bits: max_texture_dimension_2d.trailing_zeros(),
+                    encoded_paints_tex_width_bits: max_texture_dimension_2d.trailing_zeros(),
+                    strip_offset_x: 0,
+                    strip_offset_y: 0,
+                    negate_ndc: u32::from(negate_ndc),
                 };
 
                 gl.bind_buffer(
@@ -843,6 +1542,11 @@ impl WebGlPrograms {
                     height: u32::from(Tile::HEIGHT) * total_slots,
                     strip_height: u32::from(Tile::HEIGHT),
                     alphas_tex_width_bits: max_texture_dimension_2d.trailing_zeros(),
+                    encoded_paints_tex_width_bits: max_texture_dimension_2d.trailing_zeros(),
+                    strip_offset_x: 0,
+                    strip_offset_y: 0,
+                    // Always use y-down when rendering to slots.
+                    negate_ndc: 0,
                 };
 
                 gl.bind_buffer(
@@ -879,68 +1583,36 @@ impl WebGlPrograms {
                 );
             }
 
-            // Resize the view texture.
-            gl.bind_texture(
-                WebGl2RenderingContext::TEXTURE_2D,
-                Some(&self.resources.view_texture),
-            );
-            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
-                WebGl2RenderingContext::TEXTURE_2D,
-                0,
-                WebGl2RenderingContext::RGBA8 as i32,
-                new_render_size.width as i32,
-                new_render_size.height as i32,
-                0,
-                WebGl2RenderingContext::RGBA,
-                WebGl2RenderingContext::UNSIGNED_BYTE,
-                None,
-            )
-            .unwrap();
-
             self.render_size = new_render_size.clone();
+            self.negate_ndc = negate_ndc;
         }
     }
 
     /// Upload alpha data to the texture.
-    fn upload_alpha_texture(&mut self, gl: &WebGl2RenderingContext, alphas: &[u8]) {
-        if !alphas.is_empty() {
-            let alpha_texture_width = self.resources.max_texture_dimension_2d;
-            let alpha_texture_height = self.resources.alpha_texture_height;
-
-            debug_assert!(
-                alphas.len() <= (alpha_texture_width * alpha_texture_height * 16) as usize,
-                "Alpha texture dimensions are too small to fit the alpha data"
-            );
-
-            // After this copy to `self.alpha_data`, there may be stale trailing alpha values. These
-            // are not sampled, so can be left as-is.
-            // TODO: Apply the same optimization as gradient texture upload - use alphas directly
-            // instead of copying to staging buffer, by taking alphas from strip generator as a vec,
-            // resizing appropriately, truncating, and restoring back to the generator.
-            self.alpha_data[0..alphas.len()].copy_from_slice(alphas);
-            gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-            gl.bind_texture(
-                WebGl2RenderingContext::TEXTURE_2D,
-                Some(&self.resources.alphas_texture),
-            );
-
-            // Pack alpha values into RGBA uint32 texture
-            let alpha_data_as_u32 = bytemuck::cast_slice::<u8, u32>(&self.alpha_data);
-            let packed_array = js_sys::Uint32Array::from(alpha_data_as_u32);
-
-            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
-                WebGl2RenderingContext::TEXTURE_2D,
-                0,
-                WebGl2RenderingContext::RGBA32UI as i32,
-                alpha_texture_width as i32,
-                alpha_texture_height as i32,
-                0,
-                WebGl2RenderingContext::RGBA_INTEGER,
-                WebGl2RenderingContext::UNSIGNED_INT,
-                Some(&packed_array),
-            )
-            .unwrap();
+    fn upload_alpha_texture(&mut self, gl: &WebGl2RenderingContext, alphas: &mut Vec<u8>) {
+        if alphas.is_empty() {
+            return;
         }
+
+        let alpha_texture_width = self.resources.max_texture_dimension_2d;
+        let alpha_texture_height = self.resources.alpha_texture_height;
+        let total_size = alpha_texture_width as usize * alpha_texture_height as usize * 16;
+
+        let original_len = alphas.len();
+
+        // Temporarily pad the length of the alphas to the texture size before uploading.
+        alphas.resize(total_size, 0);
+
+        upload_data_to_rgba32_texture(
+            gl,
+            &self.resources.alphas_texture,
+            bytemuck::cast_slice::<u8, u32>(alphas),
+            alpha_texture_width,
+            alpha_texture_height,
+        );
+
+        // Truncate back to the original size.
+        alphas.truncate(original_len);
     }
 
     /// Upload encoded paints to the texture.
@@ -955,29 +1627,13 @@ impl WebGlPrograms {
 
             GpuEncodedPaint::serialize_to_buffer(encoded_paints, &mut self.encoded_paints_data);
 
-            gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-            gl.bind_texture(
-                WebGl2RenderingContext::TEXTURE_2D,
-                Some(&self.resources.encoded_paints_texture),
+            upload_data_to_rgba32_texture(
+                gl,
+                &self.resources.encoded_paints_texture,
+                bytemuck::cast_slice::<u8, u32>(&self.encoded_paints_data),
+                encoded_paints_texture_width,
+                encoded_paints_texture_height,
             );
-
-            // Pack encoded paints into RGBA uint32 texture
-            let encoded_paints_data_as_u32 =
-                bytemuck::cast_slice::<u8, u32>(&self.encoded_paints_data);
-            let packed_array = js_sys::Uint32Array::from(encoded_paints_data_as_u32);
-
-            gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
-                WebGl2RenderingContext::TEXTURE_2D,
-                0,
-                WebGl2RenderingContext::RGBA32UI as i32,
-                encoded_paints_texture_width as i32,
-                encoded_paints_texture_height as i32,
-                0,
-                WebGl2RenderingContext::RGBA_INTEGER,
-                WebGl2RenderingContext::UNSIGNED_INT,
-                Some(&packed_array),
-            )
-            .unwrap();
         }
     }
 
@@ -997,6 +1653,7 @@ impl WebGlPrograms {
 
         // Take ownership of the luts to avoid copying, then resize for texture padding.
         let mut luts = gradient_cache.take_luts();
+        let old_luts_len = luts.len();
         luts.resize(total_capacity, 0);
 
         gl.active_texture(WebGl2RenderingContext::TEXTURE0);
@@ -1019,22 +1676,29 @@ impl WebGlPrograms {
         .unwrap();
 
         // Restore the luts back to the cache.
+        luts.truncate(old_luts_len);
         gradient_cache.restore_luts(luts);
     }
 
     /// Clear the view framebuffer.
+    // TODO: Investigate adding tests for the clear_view behavior.
     fn clear_view_framebuffer(&mut self, gl: &WebGl2RenderingContext) {
         gl.bind_framebuffer(
             WebGl2RenderingContext::FRAMEBUFFER,
-            Some(&self.resources.view_framebuffer),
+            self.resources.view_framebuffer_override.as_deref(),
         );
         gl.clear_color(0.0, 0.0, 0.0, 0.0);
         gl.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
     }
 
-    /// Upload strip data to GPU.
-    fn upload_strips(&mut self, gl: &WebGl2RenderingContext, strips: &[GpuStrip]) {
-        if strips.is_empty() {
+    /// Uploads two strip slices (opaque then alpha) into a single GPU buffer.
+    fn upload_strip_pair(
+        &mut self,
+        gl: &WebGl2RenderingContext,
+        opaque_strips: &[GpuStrip],
+        alpha_strips: &[GpuStrip],
+    ) {
+        if opaque_strips.is_empty() && alpha_strips.is_empty() {
             return;
         }
 
@@ -1042,36 +1706,60 @@ impl WebGlPrograms {
             WebGl2RenderingContext::ARRAY_BUFFER,
             Some(&self.resources.strips_buffer),
         );
-        let strips_data = bytemuck::cast_slice(strips);
-        gl.buffer_data_with_u8_array(
+
+        let opaque_bytes: &[u8] = bytemuck::cast_slice(opaque_strips);
+        let alpha_bytes: &[u8] = bytemuck::cast_slice(alpha_strips);
+        let total_len = opaque_bytes.len() + alpha_bytes.len();
+
+        // Allocate buffer, then write both slices via bufferSubData.
+        // We don't want to pay for concatenating the two slices. It's better to
+        // simply write twice.
+        gl.buffer_data_with_i32(
             WebGl2RenderingContext::ARRAY_BUFFER,
-            strips_data,
+            total_len as i32,
             WebGl2RenderingContext::DYNAMIC_DRAW,
         );
+        if !opaque_bytes.is_empty() {
+            gl.buffer_sub_data_with_i32_and_u8_array(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                0,
+                opaque_bytes,
+            );
+        }
+        if !alpha_bytes.is_empty() {
+            gl.buffer_sub_data_with_i32_and_u8_array(
+                WebGl2RenderingContext::ARRAY_BUFFER,
+                opaque_bytes.len() as i32,
+                alpha_bytes,
+            );
+        }
     }
 }
 
 /// RAII guard for WebGL state management.
 /// Automatically saves state on creation and restores it on drop.
 /// Only saves/restores the state specified in the configuration.
-struct WebGlStateGuard<'a> {
-    gl: &'a WebGl2RenderingContext,
+struct WebGlStateGuard {
+    gl: WebGl2RenderingContext,
     config: WebGlStateConfig,
-    original_framebuffer: Option<web_sys::WebGlFramebuffer>,
-    original_read_framebuffer: Option<web_sys::WebGlFramebuffer>,
-    original_texture_2d_array: Option<web_sys::WebGlTexture>,
+    original_framebuffer: Option<WebGlFramebuffer>,
+    original_read_framebuffer: Option<WebGlFramebuffer>,
+    original_active_texture: Option<u32>,
+    original_texture_2d: Option<WebGlTexture>,
+    original_texture_2d_array: Option<WebGlTexture>,
+    original_pixel_pack_buffer: Option<WebGlBuffer>,
     scissor_enabled: bool,
     viewport: [i32; 4],
 }
 
-impl<'a> WebGlStateGuard<'a> {
+impl WebGlStateGuard {
     /// Create a new state guard with custom configuration.
-    fn with_config(gl: &'a WebGl2RenderingContext, config: WebGlStateConfig) -> Self {
+    fn with_config(gl: &WebGl2RenderingContext, config: WebGlStateConfig) -> Self {
         // Save current framebuffer binding if requested
         let original_framebuffer = if config.framebuffer {
             gl.get_parameter(WebGl2RenderingContext::FRAMEBUFFER_BINDING)
                 .ok()
-                .and_then(|v| v.dyn_into::<web_sys::WebGlFramebuffer>().ok())
+                .and_then(|v| v.dyn_into::<WebGlFramebuffer>().ok())
         } else {
             None
         };
@@ -1080,7 +1768,24 @@ impl<'a> WebGlStateGuard<'a> {
         let original_read_framebuffer = if config.read_framebuffer {
             gl.get_parameter(WebGl2RenderingContext::READ_FRAMEBUFFER_BINDING)
                 .ok()
-                .and_then(|v| v.dyn_into::<web_sys::WebGlFramebuffer>().ok())
+                .and_then(|v| v.dyn_into::<WebGlFramebuffer>().ok())
+        } else {
+            None
+        };
+
+        let original_active_texture = if config.active_texture {
+            gl.get_parameter(WebGl2RenderingContext::ACTIVE_TEXTURE)
+                .ok()
+                .and_then(|v| v.as_f64())
+                .map(|v| v as u32)
+        } else {
+            None
+        };
+
+        let original_texture_2d = if config.texture_2d {
+            gl.get_parameter(WebGl2RenderingContext::TEXTURE_BINDING_2D)
+                .ok()
+                .and_then(|v| v.dyn_into::<WebGlTexture>().ok())
         } else {
             None
         };
@@ -1089,7 +1794,15 @@ impl<'a> WebGlStateGuard<'a> {
         let original_texture_2d_array = if config.texture_2d_array {
             gl.get_parameter(WebGl2RenderingContext::TEXTURE_BINDING_2D_ARRAY)
                 .ok()
-                .and_then(|v| v.dyn_into::<web_sys::WebGlTexture>().ok())
+                .and_then(|v| v.dyn_into::<WebGlTexture>().ok())
+        } else {
+            None
+        };
+
+        let original_pixel_pack_buffer = if config.pixel_pack_buffer {
+            gl.get_parameter(WebGl2RenderingContext::PIXEL_PACK_BUFFER_BINDING)
+                .ok()
+                .and_then(|v| v.dyn_into::<WebGlBuffer>().ok())
         } else {
             None
         };
@@ -1123,18 +1836,21 @@ impl<'a> WebGlStateGuard<'a> {
         };
 
         Self {
-            gl,
+            gl: gl.clone(),
             config,
             original_framebuffer,
             original_read_framebuffer,
+            original_active_texture,
+            original_texture_2d,
             original_texture_2d_array,
+            original_pixel_pack_buffer,
             scissor_enabled,
             viewport,
         }
     }
 
     /// Create a state guard for clearing an atlas region operations.
-    fn for_clear_atlas_region(gl: &'a WebGl2RenderingContext) -> Self {
+    fn for_clear_atlas_region(gl: &WebGl2RenderingContext) -> Self {
         Self::with_config(
             gl,
             WebGlStateConfig {
@@ -1147,11 +1863,12 @@ impl<'a> WebGlStateGuard<'a> {
     }
 
     /// Create a state guard for texture copying operations.
-    fn for_texture_copy(gl: &'a WebGl2RenderingContext) -> Self {
+    fn for_texture_copy(gl: &WebGl2RenderingContext) -> Self {
         Self::with_config(
             gl,
             WebGlStateConfig {
                 read_framebuffer: true,
+                active_texture: true,
                 texture_2d_array: true,
                 ..Default::default()
             },
@@ -1159,7 +1876,7 @@ impl<'a> WebGlStateGuard<'a> {
     }
 }
 
-impl Drop for WebGlStateGuard<'_> {
+impl Drop for WebGlStateGuard {
     /// Restore WebGL state when the guard goes out of scope.
     /// Only restores state that was configured to be saved.
     fn drop(&mut self) {
@@ -1198,11 +1915,31 @@ impl Drop for WebGlStateGuard<'_> {
             );
         }
 
+        if self.config.active_texture
+            && let Some(active_texture) = self.original_active_texture
+        {
+            self.gl.active_texture(active_texture);
+        }
+
+        if self.config.texture_2d {
+            self.gl.bind_texture(
+                WebGl2RenderingContext::TEXTURE_2D,
+                self.original_texture_2d.as_ref(),
+            );
+        }
+
         // Restore original 2D array texture binding if it was saved
         if self.config.texture_2d_array {
             self.gl.bind_texture(
                 WebGl2RenderingContext::TEXTURE_2D_ARRAY,
                 self.original_texture_2d_array.as_ref(),
+            );
+        }
+
+        if self.config.pixel_pack_buffer {
+            self.gl.bind_buffer(
+                WebGl2RenderingContext::PIXEL_PACK_BUFFER,
+                self.original_pixel_pack_buffer.as_ref(),
             );
         }
     }
@@ -1214,12 +1951,71 @@ struct WebGlStateConfig {
     framebuffer: bool,
     /// Save/restore read framebuffer binding (`READ_FRAMEBUFFER_BINDING`)
     read_framebuffer: bool,
+    /// Save/restore active texture unit (`ACTIVE_TEXTURE`)
+    active_texture: bool,
+    /// Save/restore 2D texture binding (`TEXTURE_BINDING_2D`)
+    texture_2d: bool,
     /// Save/restore 2D array texture binding (`TEXTURE_BINDING_2D_ARRAY`)
     texture_2d_array: bool,
+    /// Save/restore pixel pack buffer binding (`PIXEL_PACK_BUFFER_BINDING`)
+    pixel_pack_buffer: bool,
     /// Save/restore scissor test state
     scissor: bool,
     /// Save/restore viewport
     viewport: bool,
+}
+
+#[cfg(feature = "probe")]
+fn launch_probe(
+    gl: &WebGl2RenderingContext,
+    framebuffer: &Framebuffer,
+    width: u16,
+    height: u16,
+) -> WebGlPendingProbe {
+    let pixel_pack_buffer = gl.create_buffer().unwrap();
+    let byte_len = i32::from(width) * i32::from(height) * 4;
+
+    gl.bind_buffer(
+        WebGl2RenderingContext::PIXEL_PACK_BUFFER,
+        Some(&pixel_pack_buffer),
+    );
+    gl.buffer_data_with_i32(
+        WebGl2RenderingContext::PIXEL_PACK_BUFFER,
+        byte_len,
+        WebGl2RenderingContext::STREAM_READ,
+    );
+    gl.bind_framebuffer(
+        WebGl2RenderingContext::FRAMEBUFFER,
+        Some(framebuffer.deref()),
+    );
+    gl.read_pixels_with_i32(
+        0,
+        0,
+        i32::from(width),
+        i32::from(height),
+        WebGl2RenderingContext::RGBA,
+        WebGl2RenderingContext::UNSIGNED_BYTE,
+        0,
+    )
+    .unwrap();
+    // Create a fence that notifies us once rendering is complete and the contents have been
+    // transferred from the framebuffer to the pixel pack buffer.
+    let sync = gl
+        .fence_sync(WebGl2RenderingContext::SYNC_GPU_COMMANDS_COMPLETE, 0)
+        .unwrap();
+    // https://wikis.khronos.org/opengl/Sync_Object
+    // "It is important that syncs are properly flushed into the GPU's command queue. Without
+    // proper flushing, the sync object may never be signaled."
+    gl.flush();
+    gl.bind_buffer(WebGl2RenderingContext::PIXEL_PACK_BUFFER, None);
+
+    WebGlPendingProbe {
+        gl: gl.clone(),
+        sync: Some(sync),
+        buffer: Some(pixel_pack_buffer),
+        width,
+        height,
+    }
 }
 
 /// Create a WebGL shader program from vertex and fragment sources.
@@ -1227,11 +2023,9 @@ fn create_shader_program(
     gl: &WebGl2RenderingContext,
     vertex_src: &str,
     fragment_src: &str,
-) -> WebGlProgram {
+) -> Program {
     // Compile vertex shader.
-    let vertex_shader = gl
-        .create_shader(WebGl2RenderingContext::VERTEX_SHADER)
-        .unwrap();
+    let vertex_shader = VertexShader::new(gl);
     gl.shader_source(&vertex_shader, vertex_src);
     gl.compile_shader(&vertex_shader);
 
@@ -1247,9 +2041,7 @@ fn create_shader_program(
     }
 
     // Compile fragment shader.
-    let fragment_shader = gl
-        .create_shader(WebGl2RenderingContext::FRAGMENT_SHADER)
-        .unwrap();
+    let fragment_shader = FragmentShader::new(gl);
     gl.shader_source(&fragment_shader, fragment_src);
     gl.compile_shader(&fragment_shader);
 
@@ -1265,7 +2057,7 @@ fn create_shader_program(
     }
 
     // Create and link the program.
-    let program = gl.create_program().unwrap();
+    let program = Program::new(gl);
     gl.attach_shader(&program, &vertex_shader);
     gl.attach_shader(&program, &fragment_shader);
     gl.link_program(&program);
@@ -1281,14 +2073,11 @@ fn create_shader_program(
         panic!("Failed to link program: {info}");
     }
 
-    gl.delete_shader(Some(&vertex_shader));
-    gl.delete_shader(Some(&fragment_shader));
-
     program
 }
 
 /// Get the  uniform locations for the `render_strips` program.
-fn get_strip_uniforms(gl: &WebGl2RenderingContext, program: &WebGlProgram) -> StripUniforms {
+fn get_strip_uniforms(gl: &WebGl2RenderingContext, program: &Program) -> StripUniforms {
     let config_vs_name = render_strips::vertex::CONFIG;
     let config_vs_block_index = gl.get_uniform_block_index(program, config_vs_name);
 
@@ -1317,6 +2106,7 @@ fn get_strip_uniforms(gl: &WebGl2RenderingContext, program: &WebGlProgram) -> St
     let encoded_paints_texture_fs_name = render_strips::fragment::ENCODED_PAINTS_TEXTURE;
     let encoded_paints_texture_vs_name = render_strips::vertex::ENCODED_PAINTS_TEXTURE;
     let gradient_texture_name = render_strips::fragment::GRADIENT_TEXTURE;
+    let external_texture_name = render_strips::fragment::EXTERNAL_TEXTURE;
 
     StripUniforms {
         config_vs_block_index,
@@ -1339,11 +2129,14 @@ fn get_strip_uniforms(gl: &WebGl2RenderingContext, program: &WebGlProgram) -> St
         gradient_texture: gl
             .get_uniform_location(program, gradient_texture_name)
             .unwrap(),
+        external_texture: gl
+            .get_uniform_location(program, external_texture_name)
+            .unwrap(),
     }
 }
 
 /// Get the uniform locations for the `clear_slots` program.
-fn get_clear_uniforms(gl: &WebGl2RenderingContext, program: &WebGlProgram) -> ClearUniforms {
+fn get_clear_uniforms(gl: &WebGl2RenderingContext, program: &Program) -> ClearUniforms {
     let config_name = clear_slots::vertex::CONFIG;
     let config_block_index = gl.get_uniform_block_index(program, config_name);
 
@@ -1359,47 +2152,183 @@ fn get_clear_uniforms(gl: &WebGl2RenderingContext, program: &WebGlProgram) -> Cl
     ClearUniforms { config_block_index }
 }
 
+fn get_filter_pass_uniforms(gl: &WebGl2RenderingContext, program: &Program) -> FilterPassUniforms {
+    let filter_data = gl
+        .get_uniform_location(program, filters::fragment::FILTER_DATA)
+        .unwrap();
+    let in_tex = gl
+        .get_uniform_location(program, filters::fragment::IN_TEX)
+        .unwrap();
+    let original_tex = gl
+        .get_uniform_location(program, filters::fragment::ORIGINAL_TEX)
+        .unwrap();
+    FilterPassUniforms {
+        filter_data,
+        in_tex,
+        original_tex,
+    }
+}
+
+fn create_filter_atlas_texture(gl: &WebGl2RenderingContext, width: u32, height: u32) -> Texture {
+    let texture = Texture::new(gl);
+    gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+    gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
+    gl.tex_parameteri(
+        WebGl2RenderingContext::TEXTURE_2D,
+        WebGl2RenderingContext::TEXTURE_MIN_FILTER,
+        WebGl2RenderingContext::LINEAR as i32,
+    );
+    gl.tex_parameteri(
+        WebGl2RenderingContext::TEXTURE_2D,
+        WebGl2RenderingContext::TEXTURE_MAG_FILTER,
+        WebGl2RenderingContext::LINEAR as i32,
+    );
+    gl.tex_parameteri(
+        WebGl2RenderingContext::TEXTURE_2D,
+        WebGl2RenderingContext::TEXTURE_WRAP_S,
+        WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameteri(
+        WebGl2RenderingContext::TEXTURE_2D,
+        WebGl2RenderingContext::TEXTURE_WRAP_T,
+        WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+        WebGl2RenderingContext::TEXTURE_2D,
+        0,
+        WebGl2RenderingContext::RGBA8 as i32,
+        width as i32,
+        height as i32,
+        0,
+        WebGl2RenderingContext::RGBA,
+        WebGl2RenderingContext::UNSIGNED_BYTE,
+        None,
+    )
+    .unwrap();
+    texture
+}
+
+/// Vertex attribute layout for [`FilterInstanceData`].
+const FILTER_ATTRIBS: [(i32, i32); 9] = [
+    (2, 0),  // src_offset
+    (2, 8),  // src_size
+    (2, 16), // dest_offset
+    (2, 24), // dest_size
+    (2, 32), // dest_atlas_size
+    (1, 40), // filter_data_offset
+    (2, 44), // original_offset
+    (2, 52), // original_size
+    (1, 60), // pass_kind
+];
+
+const FILTER_INSTANCE_STRIDE: i32 = size_of::<FilterInstanceData>() as i32;
+
+fn initialize_filter_vao(gl: &WebGl2RenderingContext, resources: &WebGlResources) {
+    gl.bind_vertex_array(Some(&resources.filter_vao));
+    gl.bind_buffer(
+        WebGl2RenderingContext::ARRAY_BUFFER,
+        Some(&resources.filter_instance_buffer),
+    );
+
+    for (loc, &(components, offset)) in FILTER_ATTRIBS.iter().enumerate() {
+        let loc = loc as u32;
+        gl.enable_vertex_attrib_array(loc);
+        gl.vertex_attrib_i_pointer_with_i32(
+            loc,
+            components,
+            WebGl2RenderingContext::UNSIGNED_INT,
+            FILTER_INSTANCE_STRIDE,
+            offset,
+        );
+        gl.vertex_attrib_divisor(loc, 1);
+    }
+
+    gl.bind_vertex_array(None);
+}
+
+/// Create a texture with nearest neighbor sampling and clamp-to-edge wrapping.
+fn create_texture(gl: &WebGl2RenderingContext) -> Texture {
+    create_texture_inner(gl, WebGl2RenderingContext::TEXTURE_2D)
+}
+
+/// Create a texture array with nearest neighbor sampling and
+/// clamp-to-edge wrapping.
+fn create_texture_array(gl: &WebGl2RenderingContext) -> Texture {
+    create_texture_inner(gl, WebGl2RenderingContext::TEXTURE_2D_ARRAY)
+}
+
+fn create_texture_inner(gl: &WebGl2RenderingContext, target: u32) -> Texture {
+    let texture = Texture::new(gl);
+    gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+    gl.bind_texture(target, Some(&texture));
+    // The filter and wrap modes are irrelevant because the shader
+    // (`render_strips.wgsl`) exclusively uses `textureLoad`, which bypasses
+    // the sampler entirely.
+    gl.tex_parameteri(
+        target,
+        WebGl2RenderingContext::TEXTURE_MIN_FILTER,
+        WebGl2RenderingContext::NEAREST as i32,
+    );
+    gl.tex_parameteri(
+        target,
+        WebGl2RenderingContext::TEXTURE_MAG_FILTER,
+        WebGl2RenderingContext::NEAREST as i32,
+    );
+    gl.tex_parameteri(
+        target,
+        WebGl2RenderingContext::TEXTURE_WRAP_S,
+        WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+    );
+    gl.tex_parameteri(
+        target,
+        WebGl2RenderingContext::TEXTURE_WRAP_T,
+        WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+    );
+    // Also only to be defensive, in theory this shouldn't be necessary since we use
+    // `NEAREST` for both filters.
+    gl.tex_parameteri(target, WebGl2RenderingContext::TEXTURE_MAX_LEVEL, 0);
+
+    texture
+}
+
+/// Create a 1x1 RGBA8 placeholder texture.
+fn create_placeholder_texture(gl: &WebGl2RenderingContext) -> Texture {
+    let texture = create_texture(gl);
+    gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+        WebGl2RenderingContext::TEXTURE_2D,
+        0,
+        WebGl2RenderingContext::RGBA8 as i32,
+        1,
+        1,
+        0,
+        WebGl2RenderingContext::RGBA,
+        WebGl2RenderingContext::UNSIGNED_BYTE,
+        Some(&[0, 0, 0, 0]),
+    )
+    .unwrap();
+    texture
+}
+
 /// Create all WebGL resources needed for rendering.
 fn create_webgl_resources(
     gl: &WebGl2RenderingContext,
     image_cache: &ImageCache,
+    filter_context: &FilterContext,
     slot_count: usize,
 ) -> WebGlResources {
-    let strip_vao = gl.create_vertex_array().unwrap();
-    let clear_vao = gl.create_vertex_array().unwrap();
+    let strip_vao = VertexArray::new(gl);
+    let clear_vao = VertexArray::new(gl);
+    let filter_vao = VertexArray::new(gl);
+    let filter_instance_buffer = Buffer::new(gl);
 
-    let strips_buffer = gl.create_buffer().unwrap();
-    let view_config_buffer = gl.create_buffer().unwrap();
-    let slot_config_buffer = gl.create_buffer().unwrap();
-    let clear_slot_indices_buffer = gl.create_buffer().unwrap();
-    let clear_config_buffer = gl.create_buffer().unwrap();
+    let strips_buffer = Buffer::new(gl);
+    let view_config_buffer = Buffer::new(gl);
+    let slot_config_buffer = Buffer::new(gl);
+    let clear_slot_indices_buffer = Buffer::new(gl);
+    let clear_config_buffer = Buffer::new(gl);
 
     // Create and configure alpha texture.
-    let alphas_texture = gl.create_texture().unwrap();
-    {
-        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&alphas_texture));
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
-            WebGl2RenderingContext::NEAREST as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MAG_FILTER,
-            WebGl2RenderingContext::NEAREST as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_S,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_T,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-    }
+    let alphas_texture = create_texture(gl);
 
     let AtlasConfig {
         atlas_size: (atlas_width, atlas_height),
@@ -1409,104 +2338,37 @@ fn create_webgl_resources(
     let atlas_texture_array =
         create_atlas_texture_array(gl, *atlas_width, *atlas_height, *initial_atlas_count as u32);
 
+    // Create a 1x1 stub atlas texture array for use during render_to_atlas.
+    // This avoids binding the real atlas as a shader input while it is the render target.
+    let stub_atlas_texture_array = create_atlas_texture_array(gl, 1, 1, 1);
+
     // Create and configure encoded paints texture.
-    let encoded_paints_texture = gl.create_texture().unwrap();
-    {
-        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-        gl.bind_texture(
-            WebGl2RenderingContext::TEXTURE_2D,
-            Some(&encoded_paints_texture),
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
-            WebGl2RenderingContext::NEAREST as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MAG_FILTER,
-            WebGl2RenderingContext::NEAREST as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_S,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_T,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-    }
+    let encoded_paints_texture = create_texture(gl);
 
     // Create and configure gradient texture.
-    let gradient_texture = gl.create_texture().unwrap();
-    {
-        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&gradient_texture));
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
-            WebGl2RenderingContext::LINEAR as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MAG_FILTER,
-            WebGl2RenderingContext::LINEAR as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_S,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_T,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-    }
-
-    // Create and configure view texture.
-    let view_texture = gl.create_texture().unwrap();
-    {
-        gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-        gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&view_texture));
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
-            WebGl2RenderingContext::LINEAR as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_MAG_FILTER,
-            WebGl2RenderingContext::LINEAR as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_S,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-        gl.tex_parameteri(
-            WebGl2RenderingContext::TEXTURE_2D,
-            WebGl2RenderingContext::TEXTURE_WRAP_T,
-            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-        );
-    };
-    // Create framebuffer for the view texture.
-    let view_framebuffer = create_framebuffer_for_texture(gl, &view_texture);
+    let gradient_texture = create_texture(gl);
+    let placeholder_external_texture = create_placeholder_texture(gl);
 
     // Create slot textures and framebuffers.
-    let slot_textures: [WebGlTexture; 2] = [
+    let slot_textures: [Texture; 2] = [
         create_slot_texture(gl, slot_count),
         create_slot_texture(gl, slot_count),
     ];
 
-    let slot_framebuffers: [WebGlFramebuffer; 2] = [
+    let slot_framebuffers: [Framebuffer; 2] = [
         create_framebuffer_for_texture(gl, &slot_textures[0]),
         create_framebuffer_for_texture(gl, &slot_textures[1]),
     ];
 
     let max_texture_dimension_2d = get_max_texture_dimension_2d(gl);
+
+    let filter_data_texture = create_texture(gl);
+    let filter_config_buffer = Buffer::new(gl);
+
+    let AtlasConfig {
+        atlas_size: (filter_atlas_width, filter_atlas_height),
+        ..
+    } = filter_context.image_cache.atlas_manager().config();
 
     WebGlResources {
         strip_vao,
@@ -1517,6 +2379,7 @@ fn create_webgl_resources(
         encoded_paints_texture,
         encoded_paints_texture_height: 0,
         gradient_texture,
+        placeholder_external_texture,
         gradient_texture_height: 0,
         view_config_buffer,
         slot_config_buffer,
@@ -1525,9 +2388,25 @@ fn create_webgl_resources(
         clear_config_buffer,
         slot_textures,
         slot_framebuffers,
-        view_texture,
-        view_framebuffer,
+        view_framebuffer_override: None,
+        depth_cleared_this_frame: false,
+        // Note: we use DEPTH (not DEPTH_ATTACHMENT) because we render to the default
+        // framebuffer. If we ever support non-default framebuffers, this must change
+        // to DEPTH_ATTACHMENT.
+        depth_attachment_array: js_sys::Array::of1(&WebGl2RenderingContext::DEPTH.into()),
         max_texture_dimension_2d,
+        stub_atlas_texture_array,
+        atlas_render_framebuffer: None,
+        filter_main_atlas_framebuffer: None,
+        filter_atlas_textures: Vec::new(),
+        filter_atlas_framebuffers: Vec::new(),
+        filter_data_texture,
+        filter_data_texture_height: 0,
+        filter_instance_buffer,
+        filter_vao,
+        filter_config_buffer,
+        filter_atlas_width: *filter_atlas_width,
+        filter_atlas_height: *filter_atlas_height,
     }
 }
 
@@ -1538,33 +2417,7 @@ fn create_atlas_texture_array(
     height: u32,
     layer_count: u32,
 ) -> WebGlTextureArray {
-    let atlas_texture = gl.create_texture().unwrap();
-    gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-    gl.bind_texture(
-        WebGl2RenderingContext::TEXTURE_2D_ARRAY,
-        Some(&atlas_texture),
-    );
-
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D_ARRAY,
-        WebGl2RenderingContext::TEXTURE_MIN_FILTER,
-        WebGl2RenderingContext::LINEAR as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D_ARRAY,
-        WebGl2RenderingContext::TEXTURE_MAG_FILTER,
-        WebGl2RenderingContext::LINEAR as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D_ARRAY,
-        WebGl2RenderingContext::TEXTURE_WRAP_S,
-        WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D_ARRAY,
-        WebGl2RenderingContext::TEXTURE_WRAP_T,
-        WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
-    );
+    let atlas_texture = create_texture_array(gl);
 
     // Initialize with empty texture array data
     gl.tex_image_3d_with_opt_u8_array(
@@ -1585,35 +2438,8 @@ fn create_atlas_texture_array(
 }
 
 /// Create a texture for slot rendering.
-fn create_slot_texture(gl: &WebGl2RenderingContext, slot_count: usize) -> WebGlTexture {
-    let texture = gl.create_texture().unwrap();
-    gl.active_texture(WebGl2RenderingContext::TEXTURE0);
-    gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D,
-        WebGl2RenderingContext::TEXTURE_MIN_FILTER,
-        WebGl2RenderingContext::NEAREST_MIPMAP_LINEAR as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D,
-        WebGl2RenderingContext::TEXTURE_MAG_FILTER,
-        WebGl2RenderingContext::LINEAR as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D,
-        WebGl2RenderingContext::TEXTURE_WRAP_S,
-        WebGl2RenderingContext::REPEAT as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D,
-        WebGl2RenderingContext::TEXTURE_WRAP_T,
-        WebGl2RenderingContext::REPEAT as i32,
-    );
-    gl.tex_parameteri(
-        WebGl2RenderingContext::TEXTURE_2D,
-        WebGl2RenderingContext::TEXTURE_MAX_LEVEL,
-        0,
-    );
+fn create_slot_texture(gl: &WebGl2RenderingContext, slot_count: usize) -> Texture {
+    let texture = create_texture(gl);
 
     gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
         WebGl2RenderingContext::TEXTURE_2D,
@@ -1635,8 +2461,8 @@ fn create_slot_texture(gl: &WebGl2RenderingContext, slot_count: usize) -> WebGlT
 fn create_framebuffer_for_texture(
     gl: &WebGl2RenderingContext,
     texture: &WebGlTexture,
-) -> WebGlFramebuffer {
-    let framebuffer = gl.create_framebuffer().unwrap();
+) -> Framebuffer {
+    let framebuffer = Framebuffer::new(gl);
     gl.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(&framebuffer));
 
     gl.framebuffer_texture_2d(
@@ -1650,6 +2476,13 @@ fn create_framebuffer_for_texture(
     framebuffer
 }
 
+const STRIP_STRIDE: i32 = size_of::<GpuStrip>() as i32;
+const STRIP_ATTR_COUNT: i32 = STRIP_STRIDE / 4;
+const _: () = assert!(
+    STRIP_STRIDE == 24,
+    "GpuStrip layout must match strip vertex stride"
+);
+
 /// Initialize strip VAO.
 fn initialize_strip_vao(gl: &WebGl2RenderingContext, resources: &WebGlResources) {
     gl.bind_vertex_array(Some(&resources.strip_vao));
@@ -1658,11 +2491,7 @@ fn initialize_strip_vao(gl: &WebGl2RenderingContext, resources: &WebGlResources)
         Some(&resources.strips_buffer),
     );
 
-    let stride = mem::size_of::<GpuStrip>() as i32;
-    debug_assert_eq!(stride, 20, "expected stride of 20");
-
-    // Configure attributes.
-    for i in 0..5 {
+    for i in 0..STRIP_ATTR_COUNT {
         let location = i as u32;
         let offset = i * 4;
 
@@ -1671,7 +2500,7 @@ fn initialize_strip_vao(gl: &WebGl2RenderingContext, resources: &WebGlResources)
             location,
             1,
             WebGl2RenderingContext::UNSIGNED_INT,
-            stride,
+            STRIP_STRIDE,
             offset,
         );
 
@@ -1706,69 +2535,156 @@ fn initialize_clear_vao(gl: &WebGl2RenderingContext, resources: &WebGlResources)
 
 /// Context for WebGL rendering operations.
 // TODO: Improve buffer management. Currently a single buffer is used per resource, which means that
-// the GPU must finish drawing before the next `upload_strips` can be executed (effectively pausing
+// the GPU must finish drawing before the next `upload_strip_pair` can be executed (effectively pausing
 // execution). Investigate a buffer pool or creating a new buffer per pass.
 struct WebGlRendererContext<'a> {
     programs: &'a mut WebGlPrograms,
     gl: &'a WebGl2RenderingContext,
+    image_cache: &'a ImageCache,
+    filter_context: &'a FilterContext,
+    filter_pass_state: &'a mut FilterPassState,
 }
 
 impl WebGlRendererContext<'_> {
-    /// Render the strips to either the view or a slot texture (depending on `ix`).
-    fn do_strip_render_pass(&mut self, strips: &[GpuStrip], ix: usize, load: LoadOp) {
-        debug_assert!(ix < 3, "Invalid texture index");
-        if strips.is_empty() {
+    /// Render strips to the specified render target.
+    fn do_strip_render_pass(
+        &mut self,
+        opaque_strips: &[GpuStrip],
+        alpha_strips: &[GpuStrip],
+        target: StripPassRenderTarget,
+        load: LoadOp,
+    ) {
+        if opaque_strips.is_empty() && alpha_strips.is_empty() {
             return;
         }
-        self.programs.upload_strips(self.gl, strips);
 
-        // Bind the appropriate framebuffer.
-        if ix == 2 {
-            self.gl.bind_framebuffer(
-                WebGl2RenderingContext::FRAMEBUFFER,
-                Some(&self.programs.resources.view_framebuffer),
-            );
-            // Set viewport to match view framebuffer.
-            let width = self.programs.render_size.width;
-            let height = self.programs.render_size.height;
-            self.gl.viewport(0, 0, width as i32, height as i32);
+        let scissor_rect = match &target {
+            StripPassRenderTarget::FilterLayer(layer_id) => {
+                let image_id = self
+                    .filter_context
+                    .filter_textures
+                    .get(layer_id)
+                    .unwrap()
+                    .initial_image_id;
+                let resources = self.filter_context.image_cache.get(image_id).unwrap();
+                let atlas_idx = resources.atlas_id.as_u32() as usize;
+                let fb = &self.programs.resources.filter_atlas_framebuffers[atlas_idx];
 
-            // Use view config buffer for rendering to the main view.
-            self.gl.bind_buffer_base(
-                WebGl2RenderingContext::UNIFORM_BUFFER,
-                self.programs.strip_uniforms.config_vs_block_index,
-                Some(&self.programs.resources.view_config_buffer),
-            );
-            self.gl.bind_buffer_base(
-                WebGl2RenderingContext::UNIFORM_BUFFER,
-                self.programs.strip_uniforms.config_fs_block_index,
-                Some(&self.programs.resources.view_config_buffer),
-            );
+                self.gl
+                    .bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(fb));
+
+                let atlas_width = self.programs.resources.filter_atlas_width;
+                let atlas_height = self.programs.resources.filter_atlas_height;
+                self.gl
+                    .viewport(0, 0, atlas_width as i32, atlas_height as i32);
+
+                let filter_textures = self.filter_context.filter_textures.get(layer_id).unwrap();
+                let strip_offset_x = resources.offset[0] as i32
+                    - (filter_textures.bbox.x0() * WideTile::WIDTH) as i32;
+                let strip_offset_y =
+                    resources.offset[1] as i32 - (filter_textures.bbox.y0() * Tile::HEIGHT) as i32;
+
+                let config = Config {
+                    width: atlas_width,
+                    height: atlas_height,
+                    strip_height: u32::from(Tile::HEIGHT),
+                    alphas_tex_width_bits: self
+                        .programs
+                        .resources
+                        .max_texture_dimension_2d
+                        .trailing_zeros(),
+                    encoded_paints_tex_width_bits: self
+                        .programs
+                        .resources
+                        .max_texture_dimension_2d
+                        .trailing_zeros(),
+                    strip_offset_x,
+                    strip_offset_y,
+                    negate_ndc: 0,
+                };
+                let buf = &self.programs.resources.filter_config_buffer;
+                self.gl
+                    .bind_buffer(WebGl2RenderingContext::UNIFORM_BUFFER, Some(buf));
+                self.gl.buffer_data_with_u8_array(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    bytemuck::bytes_of(&config),
+                    WebGl2RenderingContext::DYNAMIC_DRAW,
+                );
+                self.gl.bind_buffer_base(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    self.programs.strip_uniforms.config_vs_block_index,
+                    Some(buf),
+                );
+                self.gl.bind_buffer_base(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    self.programs.strip_uniforms.config_fs_block_index,
+                    Some(buf),
+                );
+
+                Some([
+                    resources.offset[0] as i32,
+                    resources.offset[1] as i32,
+                    resources.width as i32,
+                    resources.height as i32,
+                ])
+            }
+            StripPassRenderTarget::Root(_) => {
+                self.gl.bind_framebuffer(
+                    WebGl2RenderingContext::FRAMEBUFFER,
+                    self.programs.resources.view_framebuffer_override.as_deref(),
+                );
+                let width = self.programs.render_size.width;
+                let height = self.programs.render_size.height;
+                self.gl.viewport(0, 0, width as i32, height as i32);
+
+                self.gl.bind_buffer_base(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    self.programs.strip_uniforms.config_vs_block_index,
+                    Some(&self.programs.resources.view_config_buffer),
+                );
+                self.gl.bind_buffer_base(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    self.programs.strip_uniforms.config_fs_block_index,
+                    Some(&self.programs.resources.view_config_buffer),
+                );
+
+                None
+            }
+            StripPassRenderTarget::SlotTexture(ix) => {
+                self.gl.bind_framebuffer(
+                    WebGl2RenderingContext::FRAMEBUFFER,
+                    Some(&self.programs.resources.slot_framebuffers[*ix as usize]),
+                );
+                // Set viewport to match slot framebuffer.
+                // TODO: Remove the slot height texture calculation.
+                let total_slots: usize = (self.programs.resources.max_texture_dimension_2d
+                    / u32::from(Tile::HEIGHT)) as usize;
+                // Set viewport to match slot texture.
+                let height = u32::from(Tile::HEIGHT) * total_slots as u32;
+                self.gl
+                    .viewport(0, 0, i32::from(WideTile::WIDTH), height as i32);
+
+                // Use slot config buffer for rendering to a slot texture.
+                self.gl.bind_buffer_base(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    self.programs.strip_uniforms.config_vs_block_index,
+                    Some(&self.programs.resources.slot_config_buffer),
+                );
+                self.gl.bind_buffer_base(
+                    WebGl2RenderingContext::UNIFORM_BUFFER,
+                    self.programs.strip_uniforms.config_fs_block_index,
+                    Some(&self.programs.resources.slot_config_buffer),
+                );
+
+                None
+            }
+        };
+
+        if let Some([x, y, width, height]) = scissor_rect {
+            self.gl.enable(WebGl2RenderingContext::SCISSOR_TEST);
+            self.gl.scissor(x, y, width, height);
         } else {
-            self.gl.bind_framebuffer(
-                WebGl2RenderingContext::FRAMEBUFFER,
-                Some(&self.programs.resources.slot_framebuffers[ix]),
-            );
-            // Set viewport to match slot framebuffer.
-            // TODO: Remove the slot height texture calculation.
-            let total_slots: usize = (self.programs.resources.max_texture_dimension_2d
-                / u32::from(Tile::HEIGHT)) as usize;
-            // Set viewport to match slot texture.
-            let height = u32::from(Tile::HEIGHT) * total_slots as u32;
-            self.gl
-                .viewport(0, 0, i32::from(WideTile::WIDTH), height as i32);
-
-            // Use slot config buffer for rendering to a slot texture.
-            self.gl.bind_buffer_base(
-                WebGl2RenderingContext::UNIFORM_BUFFER,
-                self.programs.strip_uniforms.config_vs_block_index,
-                Some(&self.programs.resources.slot_config_buffer),
-            );
-            self.gl.bind_buffer_base(
-                WebGl2RenderingContext::UNIFORM_BUFFER,
-                self.programs.strip_uniforms.config_fs_block_index,
-                Some(&self.programs.resources.slot_config_buffer),
-            );
+            self.gl.disable(WebGl2RenderingContext::SCISSOR_TEST);
         }
 
         // Clear framebuffer if requested.
@@ -1793,11 +2709,11 @@ impl WebGlRendererContext<'_> {
         self.gl
             .uniform1i(Some(&self.programs.strip_uniforms.alphas_texture), 0);
 
-        // Bound clip textures are dependent on `ix`:
-        // - ix=0 or ix=2: use slot_texture[1]
-        // - ix=1: use slot_texture[0]
+        let clip_texture_idx = match &target {
+            StripPassRenderTarget::SlotTexture(1) => 0,
+            _ => 1,
+        };
         self.gl.active_texture(WebGl2RenderingContext::TEXTURE1);
-        let clip_texture_idx = if ix == 1 { 0 } else { 1 };
         self.gl.bind_texture(
             WebGl2RenderingContext::TEXTURE_2D,
             Some(&self.programs.resources.slot_textures[clip_texture_idx]),
@@ -1838,13 +2754,101 @@ impl WebGlRendererContext<'_> {
         self.gl
             .uniform1i(Some(&self.programs.strip_uniforms.gradient_texture), 4);
 
-        // Draw.
-        self.gl.draw_arrays_instanced(
-            WebGl2RenderingContext::TRIANGLE_STRIP,
-            0,
-            4,
-            strips.len() as i32,
+        // We don't support external textures in our WebGL backend yet; instead we bind a
+        // placeholder so the shader's sampler binding is satisfied.
+        self.gl.active_texture(WebGl2RenderingContext::TEXTURE5);
+        self.gl.bind_texture(
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&self.programs.resources.placeholder_external_texture),
         );
+        self.gl
+            .uniform1i(Some(&self.programs.strip_uniforms.external_texture), 5);
+
+        // TODO: Today, we only support early-z rejection on the final view. If we wanted to support
+        // intermediate layers, we would require separate depth buffers for each target. We can explore
+        // that possibility in the future.
+        let is_final_view = matches!(
+            target,
+            StripPassRenderTarget::Root(RootRenderTarget::UserSurface)
+        );
+
+        self.programs
+            .upload_strip_pair(self.gl, opaque_strips, alpha_strips);
+        let opaque_count = opaque_strips.len() as i32;
+        let alpha_count = alpha_strips.len() as i32;
+
+        if is_final_view {
+            self.gl.enable(WebGl2RenderingContext::DEPTH_TEST);
+            self.gl.depth_func(WebGl2RenderingContext::LEQUAL);
+
+            // Clear depth buffer on first use per frame.
+            if !self.programs.resources.depth_cleared_this_frame {
+                self.programs.resources.depth_cleared_this_frame = true;
+                self.gl.clear_depth(1.0);
+                self.gl.clear(WebGl2RenderingContext::DEPTH_BUFFER_BIT);
+            }
+
+            // Opaque pass: front-to-back, depth test ON, depth write ON, blend OFF.
+            if opaque_count > 0 {
+                self.gl.depth_mask(true);
+                self.gl.disable(WebGl2RenderingContext::BLEND);
+                self.gl.draw_arrays_instanced(
+                    WebGl2RenderingContext::TRIANGLE_STRIP,
+                    0,
+                    4,
+                    opaque_count,
+                );
+            }
+
+            // Alpha pass: back-to-front, depth test ON, depth write OFF, blend ON.
+            if alpha_count > 0 {
+                // Rebind attribute pointers with offset to start at the alpha portion
+                // of the buffer.
+                let alpha_byte_offset = opaque_count * STRIP_STRIDE;
+                for i in 0..STRIP_ATTR_COUNT {
+                    self.gl.vertex_attrib_i_pointer_with_i32(
+                        i as u32,
+                        1,
+                        WebGl2RenderingContext::UNSIGNED_INT,
+                        STRIP_STRIDE,
+                        i * 4 + alpha_byte_offset,
+                    );
+                }
+
+                self.gl.depth_mask(false);
+                self.gl.enable(WebGl2RenderingContext::BLEND);
+                self.gl.draw_arrays_instanced(
+                    WebGl2RenderingContext::TRIANGLE_STRIP,
+                    0,
+                    4,
+                    alpha_count,
+                );
+
+                // Restore attribute offsets to base for subsequent passes.
+                for i in 0..STRIP_ATTR_COUNT {
+                    self.gl.vertex_attrib_i_pointer_with_i32(
+                        i as u32,
+                        1,
+                        WebGl2RenderingContext::UNSIGNED_INT,
+                        STRIP_STRIDE,
+                        i * 4,
+                    );
+                }
+            }
+
+            // Restore state.
+            self.gl.disable(WebGl2RenderingContext::DEPTH_TEST);
+            self.gl.depth_mask(true);
+            self.gl.enable(WebGl2RenderingContext::BLEND);
+        } else {
+            // Slot texture / intermediate: single draw with blending, no depth.
+            self.gl.draw_arrays_instanced(
+                WebGl2RenderingContext::TRIANGLE_STRIP,
+                0,
+                4,
+                opaque_count + alpha_count,
+            );
+        }
 
         // Clean up.
         self.gl.bind_vertex_array(None);
@@ -1920,8 +2924,130 @@ impl RendererBackend for WebGlRendererContext<'_> {
     }
 
     /// Execute a render pass for strips.
-    fn render_strips(&mut self, strips: &[GpuStrip], target_index: usize, load_op: LoadOp) {
-        self.do_strip_render_pass(strips, target_index, load_op);
+    fn render_strips(
+        &mut self,
+        opaque_strips: &[GpuStrip],
+        alpha_strips: &[GpuStrip],
+        _external_texture_runs: &[crate::schedule::ExternalTextureRun],
+        target: StripPassRenderTarget,
+        load_op: LoadOp,
+    ) {
+        self.do_strip_render_pass(opaque_strips, alpha_strips, target, load_op);
+    }
+
+    fn apply_filter(&mut self, layer_id: LayerId) {
+        let filter_atlas_width = self.programs.resources.filter_atlas_width;
+        let filter_atlas_height = self.programs.resources.filter_atlas_height;
+
+        self.filter_context.build_filter_passes(
+            self.filter_pass_state,
+            &layer_id,
+            self.image_cache,
+            |_atlas_idx| [filter_atlas_width, filter_atlas_height],
+            || {
+                [
+                    self.programs.resources.atlas_texture_array.size.width,
+                    self.programs.resources.atlas_texture_array.size.height,
+                ]
+            },
+        );
+
+        let filter_passes = self.filter_pass_state.filter_passes();
+        if filter_passes.is_empty() {
+            return;
+        }
+
+        self.gl.disable(WebGl2RenderingContext::BLEND);
+        self.gl.enable(WebGl2RenderingContext::SCISSOR_TEST);
+
+        let instances = self.filter_pass_state.instances();
+        self.programs.upload_filter_instances(self.gl, instances);
+
+        self.gl.use_program(Some(&self.programs.filter_program));
+        self.gl
+            .bind_vertex_array(Some(&self.programs.resources.filter_vao));
+
+        self.gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+        self.gl.bind_texture(
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&self.programs.resources.filter_data_texture),
+        );
+        self.gl
+            .uniform1i(Some(&self.programs.filter_uniforms.filter_data), 0);
+
+        for (i, pass) in filter_passes.iter().enumerate() {
+            // Base points to the correct offset for that specific filter pass.
+            let base = (i as i32) * FILTER_INSTANCE_STRIDE;
+
+            for (loc, &(components, offset)) in FILTER_ATTRIBS.iter().enumerate() {
+                self.gl.vertex_attrib_i_pointer_with_i32(
+                    loc as u32,
+                    components,
+                    WebGl2RenderingContext::UNSIGNED_INT,
+                    FILTER_INSTANCE_STRIDE,
+                    base + offset,
+                );
+            }
+
+            let (target_width, target_height) = match &pass.output {
+                FilterPassTarget::FilterAtlas(idx) => {
+                    let fb = &self.programs.resources.filter_atlas_framebuffers[*idx as usize];
+                    self.gl
+                        .bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(fb));
+                    self.gl
+                        .viewport(0, 0, filter_atlas_width as i32, filter_atlas_height as i32);
+                    (filter_atlas_width, filter_atlas_height)
+                }
+                FilterPassTarget::MainAtlas(idx) => {
+                    let fb = self
+                        .programs
+                        .resources
+                        .filter_main_atlas_framebuffer
+                        .get_or_insert_with(|| Framebuffer::new(self.gl));
+                    self.gl
+                        .bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(fb));
+                    self.gl.framebuffer_texture_layer(
+                        WebGl2RenderingContext::FRAMEBUFFER,
+                        WebGl2RenderingContext::COLOR_ATTACHMENT0,
+                        Some(&self.programs.resources.atlas_texture_array.texture),
+                        0,
+                        *idx as i32,
+                    );
+                    let width = self.programs.resources.atlas_texture_array.size.width;
+                    let height = self.programs.resources.atlas_texture_array.size.height;
+                    self.gl.viewport(0, 0, width as i32, height as i32);
+                    (width, height)
+                }
+            };
+
+            let instance = &instances[i];
+            let [x, y, width, height] = instance.scissor_rect([target_width, target_height]);
+            self.gl
+                .scissor(x as i32, y as i32, width as i32, height as i32);
+
+            let input_tex =
+                &self.programs.resources.filter_atlas_textures[pass.input_atlas_idx as usize];
+            self.gl.active_texture(WebGl2RenderingContext::TEXTURE1);
+            self.gl
+                .bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(input_tex));
+            self.gl
+                .uniform1i(Some(&self.programs.filter_uniforms.in_tex), 1);
+
+            let original_tex_idx = pass.original_atlas_idx.unwrap_or(pass.input_atlas_idx);
+            let original_tex =
+                &self.programs.resources.filter_atlas_textures[original_tex_idx as usize];
+            self.gl.active_texture(WebGl2RenderingContext::TEXTURE2);
+            self.gl
+                .bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(original_tex));
+            self.gl
+                .uniform1i(Some(&self.programs.filter_uniforms.original_tex), 2);
+
+            self.gl
+                .draw_arrays_instanced(WebGl2RenderingContext::TRIANGLE_STRIP, 0, 4, 1);
+        }
+        self.gl.bind_vertex_array(None);
+        self.gl.disable(WebGl2RenderingContext::SCISSOR_TEST);
+        self.gl.enable(WebGl2RenderingContext::BLEND);
     }
 }
 
@@ -2103,14 +3229,14 @@ impl WebGlAtlasWriter for WebGlTextureWithDimensions {
 #[derive(Debug)]
 struct WebGlTextureArray {
     /// The WebGL texture array.
-    texture: WebGlTexture,
+    texture: Texture,
     /// The size of the texture array.
     size: WebGlTextureSize,
 }
 
 impl WebGlTextureArray {
     /// Create a new WebGL texture array wrapper.
-    fn new(texture: WebGlTexture, width: u32, height: u32, depth_or_array_layers: u32) -> Self {
+    fn new(texture: Texture, width: u32, height: u32, depth_or_array_layers: u32) -> Self {
         Self {
             texture,
             size: WebGlTextureSize {
@@ -2142,13 +3268,13 @@ struct WebGlTextureSize {
 fn copy_to_texture_array_layer(
     gl: &WebGl2RenderingContext,
     source_setup: impl FnOnce(&WebGl2RenderingContext),
-    dest_texture_array: &web_sys::WebGlTexture,
+    dest_texture_array: &WebGlTexture,
     dest_layer: u32,
     dest_offset: [u32; 2],
     copy_size: [u32; 2],
 ) {
     let _state_guard = WebGlStateGuard::for_texture_copy(gl);
-    let read_framebuffer = gl.create_framebuffer().unwrap();
+    let read_framebuffer = Framebuffer::new(gl);
 
     // Bind destination texture array
     gl.active_texture(WebGl2RenderingContext::TEXTURE0);
@@ -2178,7 +3304,219 @@ fn copy_to_texture_array_layer(
         copy_size[0] as i32,
         copy_size[1] as i32,
     );
+}
 
-    // Clean up
-    gl.delete_framebuffer(Some(&read_framebuffer));
+// Upload the data to the currently bound texture assuming a RGBA32UI format.
+fn upload_data_to_rgba32_texture(
+    gl: &WebGl2RenderingContext,
+    texture: &WebGlTexture,
+    data: &[u32],
+    texture_width: u32,
+    texture_height: u32,
+) {
+    gl.active_texture(WebGl2RenderingContext::TEXTURE0);
+    gl.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(texture));
+
+    // Safety: This calling `Uint32Array::view` is unsafe because it provides a view into
+    // WASM linear memory, and any additional allocations might invalidate that view.
+    // In our case, this is not an issue because we only use this view once for uploading
+    // data to the GPU below, and no allocations happen between that.
+    // The `tex_image_2d` method is synchronous in the sense that once it returns, it is guaranteed
+    // that all necessary data has already been read, so any allocations that happen
+    // after this block don't affect this anymore.
+    //
+    // See also: https://wikis.khronos.org/opengl/Synchronization
+    // >> There are several OpenGL functions that can pull data directly from client-side memory,
+    // >> or push data directly into client-side memory. Functions like `glTexSubImage2D`,
+    // >> `glReadPixels`, `glBufferSubData` and so forth.
+    //
+    // >> Because OpenGL is defined to be synchronous, when any of these functions have
+    // >> returned, they must have finished with the client memory. When `glReadPixels` returns,
+    // >> the pixel data is in your client memory (unless you are reading into a buffer object).
+    // >> When `glBufferSubData` returns, you can immediately modify or delete whatever memory
+    // >> pointer you gave it, as OpenGL has already read as much as it wants.
+    let packed_array = unsafe { js_sys::Uint32Array::view(data) };
+
+    gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_array_buffer_view(
+        WebGl2RenderingContext::TEXTURE_2D,
+        0,
+        WebGl2RenderingContext::RGBA32UI as i32,
+        texture_width as i32,
+        texture_height as i32,
+        0,
+        WebGl2RenderingContext::RGBA_INTEGER,
+        WebGl2RenderingContext::UNSIGNED_INT,
+        Some(&packed_array),
+    )
+    .unwrap();
+}
+
+mod resource {
+    use core::ops::Deref;
+
+    use super::{
+        WebGl2RenderingContext, WebGlBuffer, WebGlFramebuffer, WebGlProgram, WebGlShader,
+        WebGlTexture, WebGlVertexArrayObject,
+    };
+
+    pub(super) trait GlResource {
+        const LABEL: &'static str;
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self>
+        where
+            Self: Sized;
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self);
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Resource<T: GlResource> {
+        gl: WebGl2RenderingContext,
+        raw: T,
+    }
+
+    // `Resource` intentionally does not implement `Clone`. There should
+    // only be a single handle to a given resources, such that it has
+    // unique ownership and we don't end up deleting the same resource
+    // twice.
+    impl<T: GlResource> Resource<T> {
+        pub(super) fn new(gl: &WebGl2RenderingContext) -> Self {
+            let raw =
+                T::create(gl).unwrap_or_else(|| panic!("failed to create WebGL {}", T::LABEL));
+            Self {
+                gl: gl.clone(),
+                raw,
+            }
+        }
+    }
+
+    impl<T: GlResource> Drop for Resource<T> {
+        fn drop(&mut self) {
+            T::delete(&self.gl, &self.raw);
+        }
+    }
+
+    impl<T: GlResource> Deref for Resource<T> {
+        type Target = T;
+
+        fn deref(&self) -> &Self::Target {
+            &self.raw
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct WebGlVertexShader(WebGlShader);
+
+    impl Deref for WebGlVertexShader {
+        type Target = WebGlShader;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct WebGlFragmentShader(WebGlShader);
+
+    impl Deref for WebGlFragmentShader {
+        type Target = WebGlShader;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl GlResource for WebGlTexture {
+        const LABEL: &'static str = "texture";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_texture()
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_texture(Some(raw));
+        }
+    }
+
+    impl GlResource for WebGlBuffer {
+        const LABEL: &'static str = "buffer";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_buffer()
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_buffer(Some(raw));
+        }
+    }
+
+    impl GlResource for WebGlFramebuffer {
+        const LABEL: &'static str = "framebuffer";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_framebuffer()
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_framebuffer(Some(raw));
+        }
+    }
+
+    impl GlResource for WebGlProgram {
+        const LABEL: &'static str = "program";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_program()
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_program(Some(raw));
+        }
+    }
+
+    impl GlResource for WebGlVertexShader {
+        const LABEL: &'static str = "vertex shader";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_shader(WebGl2RenderingContext::VERTEX_SHADER)
+                .map(Self)
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_shader(Some(raw));
+        }
+    }
+
+    impl GlResource for WebGlFragmentShader {
+        const LABEL: &'static str = "fragment shader";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_shader(WebGl2RenderingContext::FRAGMENT_SHADER)
+                .map(Self)
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_shader(Some(raw));
+        }
+    }
+
+    impl GlResource for WebGlVertexArrayObject {
+        const LABEL: &'static str = "vertex array";
+
+        fn create(gl: &WebGl2RenderingContext) -> Option<Self> {
+            gl.create_vertex_array()
+        }
+
+        fn delete(gl: &WebGl2RenderingContext, raw: &Self) {
+            gl.delete_vertex_array(Some(raw));
+        }
+    }
+
+    pub(super) type Texture = Resource<WebGlTexture>;
+    pub(super) type Buffer = Resource<WebGlBuffer>;
+    pub(super) type Framebuffer = Resource<WebGlFramebuffer>;
+    pub(super) type Program = Resource<WebGlProgram>;
+    pub(super) type VertexShader = Resource<WebGlVertexShader>;
+    pub(super) type FragmentShader = Resource<WebGlFragmentShader>;
+    pub(super) type VertexArray = Resource<WebGlVertexArrayObject>;
 }

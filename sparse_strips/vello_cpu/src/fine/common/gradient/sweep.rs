@@ -15,11 +15,14 @@ pub(crate) struct SimdSweepKind<S: Simd> {
 
 impl<S: Simd> SimdSweepKind<S> {
     pub(crate) fn new(simd: S, kind: &SweepKind) -> Self {
-        Self {
-            start_angle: f32x8::splat(simd, kind.start_angle),
-            inv_angle_delta: f32x8::splat(simd, kind.inv_angle_delta),
-            simd,
-        }
+        simd.vectorize(
+            #[inline(always)]
+            || Self {
+                start_angle: f32x8::splat(simd, kind.start_angle),
+                inv_angle_delta: f32x8::splat(simd, kind.inv_angle_delta),
+                simd,
+            },
+        )
     }
 }
 
@@ -45,9 +48,9 @@ fn x_y_to_unit_angle<S: Simd>(simd: S, x: f32x8<S>, y: f32x8<S>) -> f32x8<S> {
     let slope = x_abs.min(y_abs) / x_abs.max(y_abs);
     let s = slope * slope;
 
-    let a = f32x8::splat(simd, -7.054_738_2e-3).madd(s, f32x8::splat(simd, 2.476_102e-2));
-    let b = a.madd(s, f32x8::splat(simd, -5.185_397e-2));
-    let c = b.madd(s, f32x8::splat(simd, 0.159_121_17));
+    let a = f32x8::splat(simd, -7.054_738_2e-3).mul_add(s, f32x8::splat(simd, 2.476_102e-2));
+    let b = a.mul_add(s, f32x8::splat(simd, -5.185_397e-2));
+    let c = b.mul_add(s, f32x8::splat(simd, 0.159_121_17));
 
     let mut phi = slope * c;
 

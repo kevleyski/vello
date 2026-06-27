@@ -4,13 +4,26 @@
 //! Tests for GitHub issues.
 
 use crate::renderer::Renderer;
-use vello_common::color::palette::css::{DARK_BLUE, LIME, REBECCA_PURPLE};
+use crate::util::stops_blue_green_red_yellow;
+use crate::util::{layout_glyphs_noto_cbtf, render_pixmap};
+use std::sync::Arc;
+use vello_common::color::PremulRgba8;
+use vello_common::color::palette::css::{BLUE, DARK_BLUE, LIME, REBECCA_PURPLE};
+use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_common::kurbo::{Affine, BezPath, Rect, Shape, Stroke};
-use vello_common::peniko::{Color, ColorStop, Fill, Gradient, InterpolationAlphaSpace};
+use vello_common::paint::Image;
+use vello_common::peniko::GradientKind::Radial;
+use vello_common::peniko::color::palette::css::{PURPLE, ROYAL_BLUE, TOMATO};
+use vello_common::peniko::kurbo::Point;
+use vello_common::peniko::{
+    BlendMode, Color, ColorStop, Fill, Gradient, ImageQuality, ImageSampler,
+    InterpolationAlphaSpace, Mix,
+};
+use vello_common::peniko::{ColorStops, RadialGradientPosition};
 use vello_common::pixmap::Pixmap;
 use vello_cpu::color::palette::css::{BLACK, RED};
-use vello_cpu::peniko::Compose;
-use vello_cpu::{Level, RenderContext, RenderMode, RenderSettings};
+use vello_cpu::peniko::{Compose, Extend};
+use vello_cpu::{Level, RasterizerSettings, RenderContext, RenderMode, RenderSettings};
 use vello_dev_macros::vello_test;
 
 #[vello_test(width = 8, height = 8)]
@@ -345,7 +358,7 @@ fn do_not_panic_on_multiple_flushes(ctx: &mut impl Renderer) {
 }
 
 /// <https://github.com/linebender/vello/issues/1119>
-#[vello_test]
+#[vello_test(skip_hybrid)]
 fn clip_clear(ctx: &mut impl Renderer) {
     // initial coloring
     ctx.set_paint(LIME);
@@ -355,8 +368,23 @@ fn clip_clear(ctx: &mut impl Renderer) {
         Some(Compose::Clear.into()),
         None,
         None,
+        None,
     );
     ctx.pop_layer();
+}
+
+/// Reproduces stale pixels when the hybrid WGPU path reuses a render target without clearing it.
+#[vello_test(width = 64, height = 64, transparent)]
+fn render_target_cleared_between_frames(ctx: &mut impl Renderer) {
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 64.0, 64.0));
+    ctx.flush();
+    let _ = render_pixmap(ctx);
+
+    ctx.reset();
+
+    ctx.set_paint(LIME);
+    ctx.fill_rect(&Rect::new(16.0, 16.0, 48.0, 48.0));
 }
 
 /// <https://github.com/web-platform-tests/wpt/blob/18c64a74b1/html/canvas/element/fill-and-stroke-styles/2d.gradient.interpolate.coloralpha.html>
@@ -404,19 +432,33 @@ fn gradient_color_alpha_unmul(ctx: &mut impl Renderer) {
 #[test]
 fn multi_threading_oob_access() {
     let settings = RenderSettings {
-        level: Level::try_detect().unwrap_or(Level::fallback()),
+        level: Level::try_detect().unwrap_or(Level::baseline()),
         num_threads: 4,
-        render_mode: RenderMode::OptimizeQuality,
     };
     let mut ctx = RenderContext::new_with(100, 100, settings);
+    let mut resources = vello_cpu::Resources::new();
     let mut pixmap = Pixmap::new(100, 100);
 
     ctx.fill_path(&Rect::new(0.0, 0.0, 50.0, 50.0).to_path(0.1));
     ctx.flush();
-    ctx.render_to_pixmap(&mut pixmap);
+    ctx.render_with(
+        &mut pixmap,
+        &mut resources,
+        RasterizerSettings {
+            render_mode: RenderMode::OptimizeQuality,
+            ..Default::default()
+        },
+    );
     ctx.fill_path(&Rect::new(50.0, 50.0, 100.0, 100.0).to_path(0.1));
     ctx.flush();
-    ctx.render_to_pixmap(&mut pixmap);
+    ctx.render_with(
+        &mut pixmap,
+        &mut resources,
+        RasterizerSettings {
+            render_mode: RenderMode::OptimizeQuality,
+            ..Default::default()
+        },
+    );
 }
 
 /// See <https://github.com/linebender/vello/issues/1181>.
@@ -425,7 +467,7 @@ fn tile_clamped_off_by_one(ctx: &mut impl Renderer) {
     let rect = Rect::new(0.0, 0.0, 556.0, 8.0);
 
     ctx.set_paint(BLACK);
-    ctx.push_layer(Some(&rect.to_path(0.1)), None, None, None);
+    ctx.push_layer(Some(&rect.to_path(0.1)), None, None, None, None);
     ctx.fill_path(&rect.to_path(0.1));
     ctx.pop_layer();
 }
@@ -455,4 +497,356 @@ fn basic_alpha_compositing(ctx: &mut impl Renderer) {
 #[vello_test(no_ref)]
 fn large_dimensions(ctx: &mut impl Renderer) {
     ctx.fill_rect(&Rect::new(0.0, 0.0, u16::MAX as f64 + 10.0, 8.0));
+}
+
+#[vello_test(skip_multithreaded, skip_hybrid)]
+fn issue_1417(ctx: &mut impl Renderer) {
+    let filter_drop_shadow = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
+
+    // Unfortunately, I was unable to reduce it further... There are two issues at play:
+    // 1) We were erroneously exiting eagerly in `pop_clip` in case the clip path has zero
+    // strips, causing `push_clip` and `pop_clip` to not be symmetrical.
+    // 2) We were not properly resetting `n_zero_clips` in Wide, meaning that the issue only
+    // comes into play when rendering 1+ frame (hence the for loop).
+    for _ in 0..2 {
+        let start = 20.0;
+        let size = 60.0;
+
+        let rect = Rect::from_points((start, start), (start + size, start + size));
+        {
+            ctx.push_layer(
+                Some(&rect.to_path(0.1)),
+                None,
+                None,
+                None,
+                Some(filter_drop_shadow.clone()),
+            );
+            ctx.push_layer(None, None, None, None, None);
+            ctx.set_paint(PURPLE);
+            ctx.fill_rect(&rect);
+            ctx.pop_layer();
+            ctx.pop_layer();
+        }
+
+        let start = 100.0;
+        let size = 4.0;
+
+        let rect = Rect::from_points((start, start), (start + size, start + size));
+        {
+            ctx.push_layer(
+                Some(&rect.to_path(0.1)),
+                None,
+                None,
+                None,
+                Some(filter_drop_shadow.clone()),
+            );
+            ctx.set_paint(ROYAL_BLUE);
+            ctx.fill_rect(&rect);
+            ctx.pop_layer();
+        }
+    }
+}
+
+#[vello_test(skip_hybrid, skip_multithreaded)]
+fn issue_1421(ctx: &mut impl Renderer) {
+    let filter_flood = Filter::from_primitive(FilterPrimitive::Flood { color: TOMATO });
+    let rect = Rect::new(15.0, 15.0, 85.0, 85.0).to_path(0.1);
+
+    ctx.push_layer(Some(&rect), None, None, None, Some(filter_flood));
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_path(&rect);
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 4, height = 4)]
+fn issue_1433(ctx: &mut impl Renderer) {
+    let r = PremulRgba8::from_u8_array([255, 0, 0, 255]);
+    let b = PremulRgba8::from_u8_array([0, 0, 0, 0]);
+
+    // Three red rows, one transparent row.
+    #[rustfmt::skip]
+    let image = vec![
+        r, r, r, r,
+        r, r, r, r,
+        r, r, r, r,
+        b, b, b, b
+    ];
+
+    let pixmap = Pixmap::from_parts(image, 4, 4);
+    let source = ctx.get_image_source(Arc::new(pixmap));
+    let image = Image {
+        image: source,
+        sampler: ImageSampler {
+            x_extend: Extend::Pad,
+            y_extend: Extend::Pad,
+            quality: ImageQuality::Low,
+            alpha: 1.0,
+        },
+    };
+
+    ctx.set_paint(image);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 4.0, 4.0));
+}
+
+#[vello_test(width = 10, height = 10)]
+fn issue_1468(ctx: &mut impl Renderer) {
+    const NUM_IMAGES: usize = 6000;
+    let sampler = ImageSampler {
+        x_extend: Extend::Pad,
+        y_extend: Extend::Pad,
+        quality: ImageQuality::Low,
+        alpha: 1.0,
+    };
+
+    let dummy_rect = Rect::new(0.0, 0.0, 1.0, 1.0);
+    for i in 0..NUM_IMAGES {
+        let mut pix = Pixmap::new(1, 1);
+        let val = (i % 255 + 1) as u8;
+        pix.set_pixel(
+            0,
+            0,
+            PremulRgba8::from_u32(u32::from_be_bytes([val, val, val, 255])),
+        );
+        let source = ctx.get_image_source(Arc::new(pix));
+        ctx.set_paint(Image {
+            image: source,
+            sampler,
+        });
+        ctx.fill_rect(&dummy_rect);
+    }
+
+    let mut final_pix = Pixmap::new(1, 1);
+    final_pix.set_pixel(
+        0,
+        0,
+        PremulRgba8::from_u32(u32::from_be_bytes([255, 0, 0, 255])),
+    );
+    let final_source = ctx.get_image_source(Arc::new(final_pix));
+    ctx.set_paint(Image {
+        image: final_source,
+        sampler,
+    });
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 10.0, 10.0));
+}
+
+#[vello_test(width = 768, height = 4, skip_multithreaded, skip_hybrid)]
+fn issue_1477(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
+    let rect = Rect::new(0.0, 0.0, 768.0, 4.0);
+
+    ctx.push_layer(None, None, None, None, Some(filter));
+    ctx.set_paint(RED);
+    ctx.fill_rect(&rect);
+    ctx.pop_layer();
+
+    ctx.set_paint(BLACK);
+    ctx.fill_rect(&rect);
+}
+
+#[vello_test(width = 512, height = 16)]
+fn opaque_rect_partially_occluding_aa_edge(ctx: &mut impl Renderer) {
+    // Hypotenuse crosses strip row y in 8..12 over the full width, producing one
+    // long AA strip. The rect's interior covers depth buckets [128, 384), splitting
+    // the strip into visible runs [0, 128) and [384, 512).
+    let mut triangle = BezPath::new();
+    triangle.move_to((0.0, 8.0));
+    triangle.line_to((512.0, 12.0));
+    triangle.line_to((0.0, 12.0));
+    triangle.close_path();
+    ctx.set_paint(DARK_BLUE);
+    ctx.fill_path(&triangle);
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(96.0, 8.0, 416.0, 12.0));
+}
+
+// TODO: Re-enable hybrid once proper edge handling is implemented in Vello hybrid.
+#[vello_test(
+    skip_multithreaded,
+    skip_hybrid,
+    skip_hybrid_constrained,
+    width = 768,
+    height = 100,
+    hybrid_tolerance = 3
+)]
+fn issue_1509(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
+        std_deviation: 25.0,
+        edge_mode: EdgeMode::None,
+    });
+    let rect = Rect::new(100.0, 10.0, 668.0, 90.0);
+
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(ROYAL_BLUE);
+    ctx.fill_rect(&rect);
+    ctx.pop_layer();
+
+    ctx.set_paint(TOMATO);
+    ctx.fill_rect(&Rect::new(232.0, 30.0, 536.0, 70.0));
+}
+
+// This test exists because blending wouldn't properly preserve anti-aliasing in `vello_hybrid`.
+#[vello_test(skip_multithreaded)]
+fn issue_flush_fast_path_with_blending(ctx: &mut impl Renderer) {
+    let rect1 = Rect::new(10.5, 10.5, 70.5, 70.5);
+    ctx.set_paint(BLUE.with_alpha(0.5));
+    ctx.fill_rect(&rect1);
+    ctx.push_blend_layer(BlendMode::new(Mix::SoftLight, Compose::SrcOver));
+    let rect2 = Rect::new(30.5, 30.5, 90.5, 90.5);
+    ctx.set_paint(LIME.with_alpha(0.5));
+    ctx.fill_rect(&rect2);
+    ctx.pop_layer();
+}
+
+// This tests an issue where the rectangle fast path could produce strips below the viewport,
+// resulting in a triggered assertion in later parts of the pipeline that assume everything
+// below the viewport has been culled away.
+#[vello_test(width = 100, height = 100, no_ref)]
+fn issue_rect_at_bottom_of_viewport(ctx: &mut impl Renderer) {
+    ctx.set_transform(Affine::IDENTITY);
+    ctx.fill_rect(&Rect::new(25.0, 101.0, 200.0, 130.0));
+}
+
+#[vello_test]
+fn issue_1528(ctx: &mut impl Renderer) {
+    use smallvec::smallvec;
+    use vello_common::color::{DynamicColor, palette::css::PURPLE};
+
+    // 1) This first draw op will put the gradient into the cache.
+    let grad1 = Gradient {
+        kind: Radial(RadialGradientPosition {
+            start_center: Point::new(-200.0, -200.0),
+            start_radius: 5.0,
+            end_center: Point::new(-200.0, -200.0),
+            end_radius: 35.0,
+        }),
+        stops: stops_blue_green_red_yellow(),
+        ..Default::default()
+    };
+    ctx.set_paint(grad1);
+    ctx.fill_rect(&Rect::new(-250.0, -250.0, -150.0, -150.0));
+
+    // 2) This second draw op should _not_ result in a cache hit, because the gradient
+    // can have undefined locations. Therefore, a different LUT will be generated which adds a
+    // final transparent stop. Therefore, this gradient must be treated differently
+    // than the first one.
+    let grad2 = Gradient {
+        kind: Radial(RadialGradientPosition {
+            start_center: Point::new(30.0, 50.0),
+            start_radius: 5.0,
+            end_center: Point::new(70.0, 50.0),
+            end_radius: 20.0,
+        }),
+        stops: stops_blue_green_red_yellow(),
+        ..Default::default()
+    };
+    ctx.set_paint(grad2);
+    ctx.fill_rect(&Rect::new(10.0, 10.0, 90.0, 90.0));
+
+    // 3) In case 2) was not fulfilled, the transparent pixel will instead land on the first
+    // LUT entry of this gradient, which is purple.
+    let grad3 = Gradient {
+        kind: Radial(RadialGradientPosition {
+            start_center: Point::new(-200.0, -200.0),
+            start_radius: 5.0,
+            end_center: Point::new(-200.0, -200.0),
+            end_radius: 35.0,
+        }),
+        stops: ColorStops(smallvec![
+            ColorStop {
+                offset: 0.0,
+                color: DynamicColor::from_alpha_color(PURPLE)
+            },
+            ColorStop {
+                offset: 1.0,
+                color: DynamicColor::from_alpha_color(PURPLE)
+            },
+        ]),
+        ..Default::default()
+    };
+    ctx.set_paint(grad3);
+    ctx.fill_rect(&Rect::new(-250.0, -250.0, -150.0, -150.0));
+}
+
+#[vello_test]
+fn issue_1707_transparent_solid_fill(ctx: &mut impl Renderer) {
+    ctx.set_paint(Color::from_rgb8(0, 0, 0).with_alpha(0.001));
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+}
+
+#[vello_test]
+fn issue_fast_path_strips_in_later_round(ctx: &mut impl Renderer) {
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
+    ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
+    ctx.pop_layer();
+
+    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
+    ctx.fill_rect(&Rect::new(30.0, 30.0, 90.0, 90.0));
+}
+
+#[vello_test]
+fn issue_coarse_batch_in_later_round(ctx: &mut impl Renderer) {
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
+    ctx.fill_rect(&Rect::new(10.0, 10.0, 70.0, 70.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
+    ctx.pop_layer();
+
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
+    ctx.fill_rect(&Rect::new(30.0, 30.0, 90.0, 90.0));
+    ctx.pop_layer();
+}
+
+#[vello_test]
+fn issue_fast_path_strips_and_coarse_batch_in_later_round(ctx: &mut impl Renderer) {
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 255));
+    ctx.fill_rect(&Rect::new(25.0, 10.0, 75.0, 60.0));
+    ctx.pop_layer();
+    ctx.pop_layer();
+    ctx.pop_layer();
+
+    ctx.set_paint(Color::from_rgba8(0, 255, 0, 255));
+    ctx.fill_rect(&Rect::new(10.0, 40.0, 60.0, 90.0));
+
+    ctx.push_layer(None, None, None, None, None);
+    ctx.set_paint(Color::from_rgba8(255, 0, 0, 255));
+    ctx.fill_rect(&Rect::new(40.0, 40.0, 90.0, 90.0));
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 32, height = 32, skip_hybrid, cpu_u8_tolerance = 1)]
+fn issue_bicubic_filtering_clamping(ctx: &mut impl Renderer) {
+    let font_size = 10.0;
+    let (font, glyphs) = layout_glyphs_noto_cbtf("👀", font_size);
+
+    ctx.set_paint(BLACK);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 32.0, 32.0));
+
+    ctx.set_transform(Affine::translate((5.0, 19.0)));
+    ctx.glyph_run(&font)
+        .font_size(font_size)
+        .fill_glyphs(glyphs.into_iter());
+}
+
+#[vello_test(skip_multithreaded)]
+fn issue_filter_preserves_painter_order_for_opaque_and_alpha(ctx: &mut impl Renderer) {
+    let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 });
+
+    ctx.push_filter_layer(filter);
+    ctx.set_paint(Color::from_rgba8(0, 0, 255, 128));
+    ctx.fill_rect(&Rect::new(20.0, 20.0, 80.0, 80.0));
+    ctx.set_paint(RED);
+    ctx.fill_rect(&Rect::new(30.0, 30.0, 70.0, 70.0));
+    ctx.pop_layer();
 }

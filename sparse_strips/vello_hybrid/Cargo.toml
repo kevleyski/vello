@@ -1,6 +1,6 @@
 [package]
 name = "vello_hybrid"
-version = "0.0.4"
+version = "0.0.9"
 description = "A hybrid CPU/GPU renderer for Vello, balancing computation between CPU and GPU for efficiency."
 categories = ["rendering", "graphics"]
 keywords = ["2d", "vector-graphics"]
@@ -11,23 +11,21 @@ repository.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true
-# There are no platform specific docs.
 default-target = "x86_64-unknown-linux-gnu"
-targets = []
+targets = ["wasm32-unknown-unknown"]
 
 [dependencies]
 bytemuck = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
-vello_common = { workspace = true, features = ["std", "text"] }
+vello_common = { workspace = true, features = ["std"] }
+glifo = { workspace = true, default-features = false, optional = true }
 wgpu = { workspace = true, default-features = false, optional = true }
 vello_sparse_shaders = { workspace = true, optional = true }
 log = { workspace = true }
-guillotiere = "0.6.2"
-hashbrown = "0.15"
+hashbrown = { workspace = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = { version = "0.3.77", optional = true }
-web-sys = { version = "0.3.77", features = [
+js-sys = { version = "0.3.98", optional = true }
+web-sys = { version = "0.3.98", features = [
     "HtmlCanvasElement",
     "WebGl2RenderingContext",
     "WebGlContextAttributes",
@@ -35,8 +33,10 @@ web-sys = { version = "0.3.77", features = [
     "WebGlUniformLocation",
     "WebGlBuffer",
     "WebGlShader",
+    "WebGlSync",
     "WebGlTexture",
     "WebGlFramebuffer",
+    "WebGlRenderbuffer",
     "WebGlVertexArrayObject",
 ], optional = true }
 
@@ -47,13 +47,17 @@ vello_common = { workspace = true, features = ["pico_svg"] }
 roxmltree = "0.20.0"
 
 [features]
-default = ["wgpu", "wgpu_default"]
-std = ["wgpu", "vello_common/std"]
+default = ["wgpu", "wgpu_default", "text"]
+std = ["wgpu", "vello_common/std", "glifo?/std"]
+libm = ["vello_common/libm", "glifo?/libm"]
 wgpu = ["dep:wgpu", "dep:vello_sparse_shaders"]
 # Enable wgpu with its default features. If you need to customise the set of enabled wgpu features,
 # please disable this crate's default features, enable its "wgpu" feature, then depend on wgpu directly
 # with the features which you need enabled.
 wgpu_default = ["wgpu", "wgpu/default"]
+# Add support for text rendering.
+text = ["dep:glifo", "glifo/std"]
+probe = ["vello_common/probe"]
 webgl = ["dep:js-sys", "dep:web-sys", "dep:vello_sparse_shaders", "vello_sparse_shaders/glsl"]
 
 [lints]

@@ -3,7 +3,8 @@
 
 //! Flattening filled and stroked paths.
 
-use crate::flatten_simd::Callback;
+use crate::flatten_simd::{Callback, LinePathEl};
+use crate::geometry::RectU16;
 use crate::kurbo::{self, Affine, PathEl, Stroke, StrokeCtx, StrokeOpts};
 use alloc::vec::Vec;
 use fearless_simd::{Level, Simd, dispatch};
@@ -11,8 +12,10 @@ use log::warn;
 
 pub use crate::flatten_simd::FlattenCtx;
 
-/// The flattening tolerance.
-const TOL: f64 = 0.25;
+// The current tolerance is set to 0.25. Since `sqrt` doesn't work in const contexts, we instead
+// hardcode the squared tolerance and derive the others from that.
+pub(crate) const SQRT_TOL: f64 = 0.5;
+pub(crate) const TOL: f64 = SQRT_TOL * SQRT_TOL;
 pub(crate) const TOL_2: f64 = TOL * TOL;
 
 /// A point.
@@ -31,6 +34,16 @@ impl Point {
     /// Create a new point.
     pub const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
+    }
+}
+
+impl From<kurbo::Point> for Point {
+    #[inline(always)]
+    fn from(value: kurbo::Point) -> Self {
+        Self {
+            x: value.x as f32,
+            y: value.y as f32,
+        }
     }
 }
 
@@ -74,41 +87,126 @@ impl Line {
     }
 }
 
-/// Flatten a filled bezier path into line segments.
+/// Flatten a filled Bézier path into line segments.
+///
+/// # Open subpaths and culling
+///
+/// Open subpaths in the input path get closed by connecting the last endpoint in the subpath to
+/// the starting point. The output lines in `line_buf` describe the flattened path, but these lines
+/// may describe open subpaths, as some path elements may have been culled.
+///
+/// For example, consider the following, where the box describes the viewport, a path is marked by
+/// `*`, and the region to be filled in the viewport is shaded. For ease of drawing the ASCII art,
+/// the path elements are all lines ([`PathEl::LineTo`]), but the same also holds for Bézier path
+/// elements.
+///
+/// ```text
+///    ---> winding scan direction
+///
+///                   * * * * *
+///                 *         *
+///    ---------- * -----     *
+///    |        *░░░░░░░|     *
+///    |      *░░░░░░░░░|     *
+///    |    *░░░░░░░░░░░|     *
+///    |  *░░░░░░░░░░░░░|     *
+///    |*░░░░░░░░░░░░░░░|     *
+///   *|░░░░░░░░░░░░░░░░|     *
+/// *  |░░░░░░░░░░░░░░░░|     *
+/// *  |░░░░░░░░░░░░░░░░|     *
+/// *  ------------------     *
+/// *                         *
+/// *                         *
+/// *                         *
+/// *                         *
+/// *                         *
+/// *                         *
+/// *                         *
+/// * * * * * * * * * * * * * *
+/// ```
+///
+/// Because the winding scan direction is from left to right, only the left-of-viewport and
+/// diagonal lines matter in later stages of rendering for the winding number and pixel coverage.
+/// The other three lines can be culled.
+///
+/// ```text
+///                   *
+///                 *
+///    ---------- * -----
+///    |        *░░░░░░░|
+///    |      *░░░░░░░░░|
+///    |    *░░░░░░░░░░░|
+///    |  *░░░░░░░░░░░░░|
+///    |*░░░░░░░░░░░░░░░|
+///   *|░░░░░░░░░░░░░░░░|
+/// *  |░░░░░░░░░░░░░░░░|
+/// *  |░░░░░░░░░░░░░░░░|
+/// *  ------------------
+/// *
+/// *
+/// *
+/// *
+/// *
+/// *
+/// *
+/// ```
+///
+/// It is important to keep these flattened subpaths open after culling, as closing the subpaths
+/// might yield different geometry like the following.
+///
+/// ```text
+///                   *
+///                 **
+///    ---------- * *----
+///    |        *░░*    |
+///    |      *░░░*     |
+///    |    *░░░░*      |
+///    |  *░░░░░*       |
+///    |*░░░░░░*        |
+///   *|░░░░░░*         |
+/// *  |░░░░░*          |
+/// *  |░░░░*           |
+/// *  --- * ------------
+/// *     *
+/// *    *
+/// *   *
+/// *  *
+/// * *
+/// **
+/// *
+/// ```
 pub fn fill(
     level: Level,
     path: impl IntoIterator<Item = PathEl>,
     affine: Affine,
     line_buf: &mut Vec<Line>,
     ctx: &mut FlattenCtx,
+    cull_bbox: RectU16,
 ) {
-    dispatch!(level, simd => fill_impl(simd, path, affine, line_buf, ctx));
+    dispatch!(level, simd => fill_impl(simd, path, affine, line_buf, ctx, cull_bbox));
 }
 
 /// Flatten a filled bezier path into line segments.
+///
+/// See the note about open subpaths and culling on [`fill`].
+#[inline(always)]
 pub fn fill_impl<S: Simd>(
     simd: S,
     path: impl IntoIterator<Item = PathEl>,
     affine: Affine,
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
+    cull_bbox: RectU16,
 ) {
     line_buf.clear();
-    let iter = path.into_iter().map(|el| affine * el);
-
     let mut lb = FlattenerCallback {
         line_buf,
-        start: kurbo::Point::default(),
-        p0: kurbo::Point::default(),
+        start: Point::ZERO,
+        p0: Point::ZERO,
         is_nan: false,
-        closed: false,
     };
 
-    crate::flatten_simd::flatten(simd, iter, TOL, &mut lb, flatten_ctx);
-
-    if !lb.closed {
-        close_path(lb.start, lb.p0, lb.line_buf);
-    }
+    crate::flatten_simd::flatten(simd, path, affine, &mut lb, flatten_ctx, cull_bbox);
 
     // A path that contains NaN is ill-defined, so ignore it.
     if lb.is_nan {
@@ -117,7 +215,9 @@ pub fn fill_impl<S: Simd>(
         line_buf.clear();
     }
 }
-/// Flatten a stroked bezier path into line segments.
+/// Flatten a stroked Bézier path into line segments.
+///
+/// See the note about open subpaths and culling on [`fill`].
 pub fn stroke(
     level: Level,
     path: impl IntoIterator<Item = PathEl>,
@@ -126,6 +226,7 @@ pub fn stroke(
     line_buf: &mut Vec<Line>,
     flatten_ctx: &mut FlattenCtx,
     stroke_ctx: &mut StrokeCtx,
+    cull_bbox: RectU16,
 ) {
     // TODO: Temporary hack to ensure that strokes are scaled properly by the transform.
     let tolerance = TOL
@@ -135,7 +236,14 @@ pub fn stroke(
             .max(1.);
 
     expand_stroke(path, style, tolerance, stroke_ctx);
-    fill(level, stroke_ctx.output(), affine, line_buf, flatten_ctx);
+    fill(
+        level,
+        stroke_ctx.output(),
+        affine,
+        line_buf,
+        flatten_ctx,
+        cull_bbox,
+    );
 }
 
 /// Expand a stroked path to a filled path.
@@ -150,50 +258,29 @@ pub fn expand_stroke(
 
 struct FlattenerCallback<'a> {
     line_buf: &'a mut Vec<Line>,
-    start: kurbo::Point,
-    p0: kurbo::Point,
+    start: Point,
+    p0: Point,
     is_nan: bool,
-    closed: bool,
 }
 
 impl Callback for FlattenerCallback<'_> {
     #[inline(always)]
-    fn callback(&mut self, el: PathEl) {
-        self.is_nan |= el.is_nan();
-
+    fn callback(&mut self, el: LinePathEl) {
         match el {
-            kurbo::PathEl::MoveTo(p) => {
-                if !self.closed && self.p0 != self.start {
-                    close_path(self.start, self.p0, self.line_buf);
-                }
+            LinePathEl::MoveTo(p) => {
+                self.is_nan |= p.is_nan();
 
-                self.closed = false;
+                let p = p.into();
                 self.start = p;
                 self.p0 = p;
             }
-            kurbo::PathEl::LineTo(p) => {
-                let pt0 = Point::new(self.p0.x as f32, self.p0.y as f32);
-                let pt1 = Point::new(p.x as f32, p.y as f32);
-                self.line_buf.push(Line::new(pt0, pt1));
+            LinePathEl::LineTo(p) => {
+                self.is_nan |= p.is_nan();
+
+                let p = p.into();
+                self.line_buf.push(Line::new(self.p0, p));
                 self.p0 = p;
             }
-            el @ (kurbo::PathEl::QuadTo(_, _) | kurbo::PathEl::CurveTo(_, _, _)) => {
-                unreachable!("Path has been flattened, so shouldn't contain {el:?}.")
-            }
-            kurbo::PathEl::ClosePath => {
-                self.closed = true;
-
-                close_path(self.start, self.p0, self.line_buf);
-            }
         }
-    }
-}
-
-fn close_path(start: kurbo::Point, p0: kurbo::Point, line_buf: &mut Vec<Line>) {
-    let pt0 = Point::new(p0.x as f32, p0.y as f32);
-    let pt1 = Point::new(start.x as f32, start.y as f32);
-
-    if pt0 != pt1 {
-        line_buf.push(Line::new(pt0, pt1));
     }
 }

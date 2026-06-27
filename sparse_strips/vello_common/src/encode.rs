@@ -3,12 +3,14 @@
 
 //! Paints for drawing shapes.
 
+use crate::TextureId;
 use crate::blurred_rounded_rect::BlurredRoundedRectangle;
 use crate::color::palette::css::BLACK;
 use crate::color::{ColorSpaceTag, HueDirection, Srgb, gradient};
+use crate::geometry::RectU16;
 use crate::kurbo::{Affine, Point, Vec2};
 use crate::math::{FloatExt, compute_erf7};
-use crate::paint::{Image, ImageSource, IndexedPaint, Paint, PremulColor};
+use crate::paint::{Image, ImageSource, IndexedPaint, Paint, PremulColor, Tint};
 use crate::peniko::{ColorStop, ColorStops, Extend, Gradient, GradientKind, ImageQuality};
 use alloc::borrow::Cow;
 use alloc::fmt::Debug;
@@ -17,7 +19,7 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "multithreading"))]
 use core::cell::OnceCell;
 use core::hash::{Hash, Hasher};
-use fearless_simd::{Simd, SimdBase, SimdFloat, f32x4, f32x16, mask32x4, mask32x16};
+use fearless_simd::{Simd, SimdBase, SimdFloat, SimdFrom, f32x4, f32x16, mask32x16};
 use peniko::color::cache_key::{BitEq, BitHash, CacheKey};
 use peniko::color::gradient_unpremultiplied;
 use peniko::{
@@ -35,8 +37,6 @@ use peniko::kurbo::common::FloatFuncs as _;
 
 const DEGENERATE_THRESHOLD: f32 = 1.0e-6;
 const NUDGE_VAL: f32 = 1.0e-7;
-const PIXEL_CENTER_OFFSET: f64 = 0.5;
-
 #[cfg(feature = "std")]
 fn exp(val: f32) -> f32 {
     val.exp()
@@ -50,22 +50,32 @@ fn exp(val: f32) -> f32 {
     compile_error!("vello_common requires either the `std` or `libm` feature");
 }
 
-/// A trait for encoding gradients.
+/// A trait for encoding paints.
 pub trait EncodeExt: private::Sealed {
-    /// Encode the gradient and push it into a vector of encoded paints, returning
-    /// the corresponding paint in the process. This will also validate the gradient.
-    fn encode_into(&self, paints: &mut Vec<EncodedPaint>, transform: Affine) -> Paint;
+    /// Encode the paint and push it into a vector of encoded paints, returning
+    /// the corresponding paint in the process. This will also validate the paint.
+    fn encode_into(
+        &self,
+        paints: &mut Vec<EncodedPaint>,
+        transform: Affine,
+        tint: Option<Tint>,
+    ) -> Paint;
 }
 
 impl EncodeExt for Gradient {
     /// Encode the gradient into a paint.
-    fn encode_into(&self, paints: &mut Vec<EncodedPaint>, transform: Affine) -> Paint {
+    fn encode_into(
+        &self,
+        paints: &mut Vec<EncodedPaint>,
+        transform: Affine,
+        _tint: Option<Tint>,
+    ) -> Paint {
         // First make sure that the gradient is valid and not degenerate.
         if let Err(paint) = validate(self) {
             return paint;
         }
 
-        let mut has_opacities = self.stops.iter().any(|s| s.color.components[3] != 1.0);
+        let mut may_have_transparency = self.stops.iter().any(|s| s.color.components[3] != 1.0);
 
         let mut base_transform;
 
@@ -153,7 +163,7 @@ impl EncodeExt for Gradient {
                 // alpha-compositing in case the radial gradient is undefined in certain positions,
                 // in which case the resulting color will be transparent and thus the gradient overall
                 // must be treated as non-opaque.
-                has_opacities |= radial_kind.has_undefined();
+                may_have_transparency |= radial_kind.has_undefined();
 
                 EncodedKind::Radial(radial_kind)
             }
@@ -186,13 +196,9 @@ impl EncodeExt for Gradient {
         // This represents the transform that needs to be applied to the starting point of a
         // command before starting with the rendering.
         // First we need to account for the base transform of the shader, then
-        // we account for the fact that we sample in the center of a pixel and not in the corner by
-        // adding 0.5.
-        // Finally, we need to apply the _inverse_ paint transform to the point so that we can account
+        // we need to apply the _inverse_ paint transform to the point so that we can account
         // for the paint transform of the render context.
-        let transform = base_transform
-            * transform.inverse()
-            * Affine::translate((PIXEL_CENTER_OFFSET, PIXEL_CENTER_OFFSET));
+        let transform = base_transform * transform.inverse();
 
         // One possible approach of calculating the positions would be to apply the above
         // transform to _each_ pixel that we render in the wide tile. However, a much better
@@ -214,15 +220,18 @@ impl EncodeExt for Gradient {
             hue_direction: self.hue_direction,
         });
 
+        let has_undefined = kind.has_undefined();
+
         let encoded = EncodedGradient {
             cache_key,
             kind,
+            has_undefined,
             transform,
             x_advance,
             y_advance,
             ranges,
             extend: self.extend,
-            has_opacities,
+            may_have_transparency,
             u8_lut: OnceCell::new(),
             f32_lut: OnceCell::new(),
         };
@@ -255,8 +264,8 @@ fn validate(gradient: &Gradient) -> Result<(), Paint> {
         let f = stops[0];
         let n = stops[1];
 
-        // Offsets must be between 0 and 1.
-        if f.offset > 1.0 || f.offset < 0.0 {
+        // Offsets must be between 0 and 1, and not NaN.
+        if !(0.0..=1.0).contains(&f.offset) {
             return first;
         }
 
@@ -264,6 +273,12 @@ fn validate(gradient: &Gradient) -> Result<(), Paint> {
         if f.offset > n.offset {
             return first;
         }
+    }
+
+    // Check the last stop as well.
+    let last = gradient.stops.last().unwrap();
+    if !(0.0..=1.0).contains(&last.offset) {
+        return first;
     }
 
     let degenerate_point = |p1: &Point, p2: &Point| {
@@ -467,7 +482,12 @@ pub(crate) fn x_y_advances(transform: &Affine) -> (Vec2, Vec2) {
 impl private::Sealed for Image {}
 
 impl EncodeExt for Image {
-    fn encode_into(&self, paints: &mut Vec<EncodedPaint>, transform: Affine) -> Paint {
+    fn encode_into(
+        &self,
+        paints: &mut Vec<EncodedPaint>,
+        transform: Affine,
+        tint: Option<Tint>,
+    ) -> Paint {
         let idx = paints.len();
 
         let mut sampler = self.sampler;
@@ -491,32 +511,22 @@ impl EncodeExt for Image {
             sampler.quality = ImageQuality::Low;
         }
 
-        // Similarly to gradients, apply a 0.5 offset so we sample at the center of
-        // a pixel.
-        let transform = transform.inverse() * Affine::translate((0.5, 0.5));
+        let transform = transform.inverse();
 
         let (x_advance, y_advance) = x_y_advances(&transform);
 
-        let encoded = match &self.image {
-            ImageSource::Pixmap(pixmap) => {
-                EncodedImage {
-                    source: ImageSource::Pixmap(pixmap.clone()),
-                    sampler,
-                    // While we could optimize RGB8 images, it's probably not worth the trouble.
-                    has_opacities: true,
-                    transform,
-                    x_advance,
-                    y_advance,
-                }
-            }
-            ImageSource::OpaqueId(image) => EncodedImage {
-                source: ImageSource::OpaqueId(*image),
-                sampler,
-                has_opacities: true,
-                transform,
-                x_advance,
-                y_advance,
-            },
+        // If the tint color has alpha < 1.0, the image will have opacities
+        // even if the source pixels are all opaque.
+        let tint_has_opacity = tint.as_ref().is_some_and(|t| t.color.components[3] < 1.0);
+
+        let encoded = EncodedImage {
+            may_have_transparency: self.image.may_have_transparency() || tint_has_opacity,
+            source: self.image.clone(),
+            sampler,
+            transform,
+            x_advance,
+            y_advance,
+            tint,
         };
 
         paints.push(EncodedPaint::Image(encoded));
@@ -532,8 +542,32 @@ pub enum EncodedPaint {
     Gradient(EncodedGradient),
     /// An encoded image.
     Image(EncodedImage),
+    /// An encoded external texture.
+    ExternalTexture(EncodedExternalTexture),
     /// A blurred, rounded rectangle.
     BlurredRoundedRect(EncodedBlurredRoundedRectangle),
+}
+
+impl EncodedPaint {
+    /// Returns whether this encoded paint may produce non-opaque pixels.
+    pub fn may_have_transparency(&self) -> bool {
+        match self {
+            Self::Gradient(gradient) => gradient.may_have_transparency,
+            Self::Image(image) => image.may_have_transparency,
+            Self::ExternalTexture(texture) => texture.may_have_transparency,
+            Self::BlurredRoundedRect(_) => true,
+        }
+    }
+}
+
+impl Paint {
+    /// Returns whether this paint may produce non-opaque pixels.
+    pub fn may_have_transparency(&self, encoded_paints: &[EncodedPaint]) -> bool {
+        match self {
+            Self::Solid(color) => !color.is_opaque(),
+            Self::Indexed(index) => encoded_paints[index.index()].may_have_transparency(),
+        }
+    }
 }
 
 impl From<EncodedGradient> for EncodedPaint {
@@ -556,13 +590,35 @@ pub struct EncodedImage {
     /// Sampler
     pub sampler: ImageSampler,
     /// Whether the image has opacities.
-    pub has_opacities: bool,
+    pub may_have_transparency: bool,
     /// A transform to apply to the image.
     pub transform: Affine,
     /// The advance in image coordinates for one step in the x direction.
     pub x_advance: Vec2,
     /// The advance in image coordinates for one step in the y direction.
     pub y_advance: Vec2,
+    /// Optional tint applied to the image.
+    pub tint: Option<Tint>,
+}
+
+/// An encoded external texture.
+///
+/// The texture must be bound by the user at render-time in order for us to be able to sample from
+/// it; it is not interned into the renderer.
+#[derive(Debug)]
+pub struct EncodedExternalTexture {
+    /// External texture handle.
+    pub texture_id: TextureId,
+    /// Source region of the texture in texel coordinates.
+    pub source_region: RectU16,
+    /// Sampler parameters.
+    pub sampler: ImageSampler,
+    /// Whether the sampled content may contain non-opaque pixels.
+    pub may_have_transparency: bool,
+    /// Inverse destination transform, mapping scene coordinates to local source-rect space.
+    pub transform: Affine,
+    /// Optional tint applied to the sampled color.
+    pub tint: Option<Tint>,
 }
 
 /// Computed properties of a linear gradient.
@@ -707,6 +763,16 @@ pub enum EncodedKind {
     Sweep(SweepKind),
 }
 
+impl EncodedKind {
+    /// Whether the gradient is undefined at any location.
+    fn has_undefined(&self) -> bool {
+        match self {
+            Self::Radial(radial_kind) => radial_kind.has_undefined(),
+            _ => false,
+        }
+    }
+}
+
 /// An encoded gradient.
 #[derive(Debug)]
 pub struct EncodedGradient {
@@ -714,6 +780,8 @@ pub struct EncodedGradient {
     pub cache_key: CacheKey<GradientCacheKey>,
     /// The underlying kind of gradient.
     pub kind: EncodedKind,
+    /// Whether the gradient can yield undefined `t` values at some locations.
+    pub has_undefined: bool,
     /// A transform that needs to be applied to the position of the first processed pixel.
     pub transform: Affine,
     /// How much to advance into the x/y direction for one step in the x direction.
@@ -725,19 +793,21 @@ pub struct EncodedGradient {
     /// The extend of the gradient.
     pub extend: Extend,
     /// Whether the gradient requires `source_over` compositing.
-    pub has_opacities: bool,
+    pub may_have_transparency: bool,
     u8_lut: OnceCell<GradientLut<u8>>,
     f32_lut: OnceCell<GradientLut<f32>>,
 }
 
 impl EncodedGradient {
     /// Get the lookup table for sampling u8-based gradient values.
+    // No need to vectorize here, as vectorization happens in the constructor.
     pub fn u8_lut<S: Simd>(&self, simd: S) -> &GradientLut<u8> {
         self.u8_lut
             .get_or_init(|| GradientLut::new(simd, &self.ranges))
     }
 
     /// Get the lookup table for sampling f32-based gradient values.
+    // No need to vectorize here, as vectorization happens in the constructor.
     pub fn f32_lut<S: Simd>(&self, simd: S) -> &GradientLut<f32> {
         self.f32_lut
             .get_or_init(|| GradientLut::new(simd, &self.ranges))
@@ -809,6 +879,11 @@ pub struct EncodedBlurredRoundedRectangle {
     pub height: f32,
     /// An component for computing the blur effect.
     pub r1: f32,
+    /// Whether to paint the inverse (`1 - alpha`) of the blur coverage.
+    ///
+    /// When `true`, the paint is fully opaque outside the blurred rectangle and fades to
+    /// transparent inside it. This is useful for implementing inset box shadows.
+    pub invert: bool,
     /// The base color for the blurred rectangle.
     pub color: PremulColor,
     /// A transform that needs to be applied to the position of the first processed pixel.
@@ -822,7 +897,12 @@ pub struct EncodedBlurredRoundedRectangle {
 impl private::Sealed for BlurredRoundedRectangle {}
 
 impl EncodeExt for BlurredRoundedRectangle {
-    fn encode_into(&self, paints: &mut Vec<EncodedPaint>, transform: Affine) -> Paint {
+    fn encode_into(
+        &self,
+        paints: &mut Vec<EncodedPaint>,
+        transform: Affine,
+        _tint: Option<Tint>,
+    ) -> Paint {
         let rect = {
             // Ensure rectangle has positive width/height.
             let mut rect = self.rect;
@@ -878,6 +958,7 @@ impl EncodeExt for BlurredRoundedRectangle {
             r1,
             std_dev_inv,
             min_edge,
+            invert: self.invert,
             color: PremulColor::from_alpha_color(self.color),
             w,
             h,
@@ -934,17 +1015,19 @@ pub trait FromF32Color: Sized + Debug + Copy + Clone {
 impl FromF32Color for f32 {
     const ZERO: Self = 0.0;
 
+    #[inline(always)]
     fn from_f32<S: Simd>(color: f32x4<S>) -> [Self; 4] {
-        color.val
+        color.into()
     }
 }
 
 impl FromF32Color for u8 {
     const ZERO: Self = 0;
 
+    #[inline(always)]
     fn from_f32<S: Simd>(mut color: f32x4<S>) -> [Self; 4] {
         let simd = color.simd;
-        color = color.madd(f32x4::splat(simd, 255.0), f32x4::splat(simd, 0.5));
+        color = color.mul_add(f32x4::splat(simd, 255.0), f32x4::splat(simd, 0.5));
 
         [
             color[0] as Self,
@@ -965,11 +1048,16 @@ pub struct GradientLut<T: FromF32Color> {
 impl<T: FromF32Color> GradientLut<T> {
     /// Create a new lookup table.
     fn new<S: Simd>(simd: S, ranges: &[GradientRange]) -> Self {
-        let lut_size = determine_lut_size(ranges);
+        simd.vectorize(
+            #[inline(always)]
+            || Self::new_inner(simd, ranges),
+        )
+    }
 
-        // Add a bit of padding since we always process in blocks of 4, even though less might be
-        // needed.
-        let mut lut = vec![[T::ZERO, T::ZERO, T::ZERO, T::ZERO]; lut_size + 3];
+    #[inline(always)]
+    fn new_inner<S: Simd>(simd: S, ranges: &[GradientRange]) -> Self {
+        let lut_size = determine_lut_size(ranges);
+        let mut lut = vec![[T::ZERO; 4]; lut_size];
 
         // Calculate how many indices are covered by each range.
         let ramps = {
@@ -995,18 +1083,20 @@ impl<T: FromF32Color> GradientLut<T> {
             let biases = f32x16::block_splat(f32x4::from_slice(simd, &range.bias));
             let scales = f32x16::block_splat(f32x4::from_slice(simd, &range.scale));
 
-            ramp_range.step_by(4).for_each(|idx| {
-                let t_vals = f32x4::splat(simd, idx as f32).madd(inv_lut_scale, add_factor);
+            ramp_range.clone().step_by(4).for_each(|idx| {
+                let t_vals = f32x4::splat(simd, idx as f32).mul_add(inv_lut_scale, add_factor);
 
                 let t_vals = element_wise_splat(simd, t_vals);
 
-                let mut result = scales.madd(t_vals, biases);
+                let mut result = scales.mul_add(t_vals, biases);
                 let alphas = result.splat_4th();
                 // Premultiply colors, since we did interpolation in unpremultiplied space.
                 if range.interpolation_alpha_space == InterpolationAlphaSpace::Unpremultiplied {
                     result = {
-                        let mask =
-                            mask32x16::block_splat(mask32x4::from_slice(simd, &[-1, -1, -1, 0]));
+                        let mask = mask32x16::simd_from(
+                            simd,
+                            [-1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0, -1, -1, -1, 0],
+                        );
                         simd.select_f32x16(mask, result * alphas, alphas)
                     };
                 }
@@ -1019,17 +1109,14 @@ impl<T: FromF32Color> GradientLut<T> {
                 let (im1, im2) = simd.split_f32x16(result);
                 let (r1, r2) = simd.split_f32x8(im1);
                 let (r3, r4) = simd.split_f32x8(im2);
+                let rs = [r1, r2, r3, r4].map(T::from_f32);
 
-                let lut = &mut lut[idx..][..4];
-                lut[0] = T::from_f32(r1);
-                lut[1] = T::from_f32(r2);
-                lut[2] = T::from_f32(r3);
-                lut[3] = T::from_f32(r4);
+                // We always compute 4 samples at a time, but a gradient ramp does not necessarily
+                // start at a multiple of 4, therefore we might have to truncate.
+                let lut = &mut lut[idx..(idx + 4).min(lut_size)];
+                lut.copy_from_slice(&rs[..lut.len()]);
             });
         }
-
-        // Due to SIMD we worked in blocks of 4, so we need to truncate to the actual length.
-        lut.truncate(lut_size);
 
         Self { lut, scale }
     }
@@ -1044,6 +1131,12 @@ impl<T: FromF32Color> GradientLut<T> {
     #[inline(always)]
     pub fn lut(&self) -> &[[T; 4]] {
         &self.lut
+    }
+
+    /// Return the number of entries in the lookup table.
+    #[inline(always)]
+    pub fn width(&self) -> usize {
+        self.lut.len()
     }
 
     /// Get the scale factor by which to scale the parametric value to
@@ -1123,7 +1216,7 @@ mod tests {
         };
 
         assert_eq!(
-            gradient.encode_into(&mut buf, Affine::IDENTITY),
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
             BLACK.into()
         );
     }
@@ -1147,7 +1240,7 @@ mod tests {
 
         // Should return the color of the first stop.
         assert_eq!(
-            gradient.encode_into(&mut buf, Affine::IDENTITY),
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
             GREEN.into()
         );
     }
@@ -1176,7 +1269,7 @@ mod tests {
         };
 
         assert_eq!(
-            gradient.encode_into(&mut buf, Affine::IDENTITY),
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
             GREEN.into()
         );
     }
@@ -1205,7 +1298,67 @@ mod tests {
         };
 
         assert_eq!(
-            gradient.encode_into(&mut buf, Affine::IDENTITY),
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
+            GREEN.into()
+        );
+    }
+
+    #[test]
+    fn gradient_last_stop_with_infinity_offset() {
+        let mut buf = vec![];
+
+        let gradient = Gradient {
+            kind: LinearGradientPosition {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(20.0, 0.0),
+            }
+            .into(),
+            stops: ColorStops(smallvec![
+                ColorStop {
+                    offset: 0.0,
+                    color: DynamicColor::from_alpha_color(GREEN),
+                },
+                ColorStop {
+                    offset: f32::INFINITY,
+                    color: DynamicColor::from_alpha_color(BLUE),
+                },
+            ]),
+            ..Default::default()
+        };
+
+        // Invalid gradient, so fall back to first color.
+        assert_eq!(
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
+            GREEN.into()
+        );
+    }
+
+    #[test]
+    fn gradient_stop_with_nan_offset() {
+        let mut buf = vec![];
+
+        let gradient = Gradient {
+            kind: LinearGradientPosition {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(20.0, 0.0),
+            }
+            .into(),
+            stops: ColorStops(smallvec![
+                ColorStop {
+                    offset: 0.0,
+                    color: DynamicColor::from_alpha_color(GREEN),
+                },
+                ColorStop {
+                    offset: f32::NAN,
+                    color: DynamicColor::from_alpha_color(BLUE),
+                },
+            ]),
+            ..Default::default()
+        };
+
+        // Invalid gradient, so fall back to first color.
+        assert_eq!(
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
             GREEN.into()
         );
     }
@@ -1236,7 +1389,7 @@ mod tests {
         };
 
         assert_eq!(
-            gradient.encode_into(&mut buf, Affine::IDENTITY),
+            gradient.encode_into(&mut buf, Affine::IDENTITY, None),
             GREEN.into()
         );
     }

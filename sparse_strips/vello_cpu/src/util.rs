@@ -1,16 +1,72 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use crate::peniko::{BlendMode, Compose, ImageQuality, Mix};
+use crate::peniko::ImageQuality;
+use alloc::vec::Vec;
 use vello_common::encode::EncodedImage;
-use vello_common::fearless_simd::{Simd, SimdBase, f32x4, u8x32, u16x16, u16x32};
+use vello_common::fearless_simd::{Simd, SimdBase, f32x4, u8x32};
 use vello_common::math::FloatExt;
+use vello_common::tile::Tile;
+use vello_common::util::Div255Ext;
 
-#[allow(
-    dead_code,
-    reason = "this is not used because the division by 255 is now done with SIMD, but\
-we still keep it around to document its properties."
-)]
+pub(crate) trait Clear {
+    fn clear(&mut self);
+}
+
+impl<T> Clear for Vec<T> {
+    fn clear(&mut self) {
+        Self::clear(self);
+    }
+}
+
+/// Pool for reusing allocations.
+#[derive(Debug)]
+pub(crate) struct Pool<T> {
+    entries: Vec<T>,
+    clear_on_submit: bool,
+}
+
+impl<T> Default for Pool<T> {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl<T> Pool<T> {
+    /// Create a new pool.
+    ///
+    /// `clear_on_submit` decides whether submitted values should
+    /// be cleared when they are submitted or whether they should retain
+    /// their original contents.
+    pub(crate) fn new(clear_on_submit: bool) -> Self {
+        Self {
+            entries: Vec::new(),
+            clear_on_submit,
+        }
+    }
+
+    pub(crate) fn take(&mut self) -> T
+    where
+        T: Default,
+    {
+        self.entries.pop().unwrap_or_default()
+    }
+
+    pub(crate) fn submit(&mut self, mut entry: T)
+    where
+        T: Clear,
+    {
+        if self.clear_on_submit {
+            entry.clear();
+        }
+
+        self.entries.push(entry);
+    }
+}
+
+/// Pool for reusing vector allocations.
+pub(crate) type VecPool<T> = Pool<Vec<T>>;
+
 pub(crate) mod scalar {
     /// Perform an approximate division by 255.
     ///
@@ -79,46 +135,6 @@ impl<S: Simd> NormalizedMulExt for u8x32<S> {
     }
 }
 
-pub(crate) trait Div255Ext {
-    fn div_255(self) -> Self;
-}
-
-impl<S: Simd> Div255Ext for u16x32<S> {
-    #[inline(always)]
-    fn div_255(self) -> Self {
-        let p1 = Self::splat(self.simd, 255);
-        let p2 = self + p1;
-        p2.shr(8)
-    }
-}
-
-impl<S: Simd> Div255Ext for u16x16<S> {
-    #[inline(always)]
-    fn div_255(self) -> Self {
-        let p1 = Self::splat(self.simd, 255);
-        let p2 = self + p1;
-        p2.shr(8)
-    }
-}
-
-#[inline(always)]
-pub(crate) fn normalized_mul<S: Simd>(a: u8x32<S>, b: u8x32<S>) -> u16x32<S> {
-    (S::widen_u8x32(a.simd, a) * S::widen_u8x32(b.simd, b)).div_255()
-}
-
-pub(crate) trait BlendModeExt {
-    fn is_default(&self) -> bool;
-}
-
-impl BlendModeExt for BlendMode {
-    // peniko uses `Clip` instead of `Normal` as the default, hence this override.
-    // TODO: This default has changed, re-evaluate.
-    #[expect(deprecated, reason = "Provided by the user, need to handle correctly.")]
-    fn is_default(&self) -> bool {
-        matches!(self.mix, Mix::Normal | Mix::Clip) && self.compose == Compose::SrcOver
-    }
-}
-
 pub(crate) trait EncodedImageExt {
     fn has_skew(&self) -> bool;
     fn nearest_neighbor(&self) -> bool;
@@ -152,5 +168,69 @@ impl<S: Simd> Premultiply for f32x4<S> {
 
         self.simd
             .select_f32x4(self.simd.simd_eq_f32x4(alphas, zero), zero, divided)
+    }
+}
+
+/// A horizontal span in pixel coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct Span {
+    /// The horizontal start position in pixels.
+    x: u16,
+    /// The horizontal span width in pixels.
+    width: u16,
+}
+
+impl Span {
+    /// Creates a span from pixel coordinates.
+    pub fn new(x: u16, width: u16) -> Self {
+        Self { x, width }
+    }
+
+    /// Creates a span from tile coordinates.
+    pub fn new_tile(tile_x: u16, tile_width: u16) -> Self {
+        Self {
+            x: tile_x * Tile::WIDTH,
+            width: tile_width * Tile::WIDTH,
+        }
+    }
+
+    /// Returns the horizontal start position in tile coordinates.
+    pub fn tile_x(self) -> u16 {
+        self.x / Tile::WIDTH
+    }
+
+    /// Returns the exclusive horizontal end position in tile coordinates.
+    pub fn tile_end(self) -> u16 {
+        self.pixel_end().div_ceil(Tile::WIDTH)
+    }
+
+    /// Extends this span to include another span.
+    pub fn extend(&mut self, other: Self) {
+        let x = self.x.min(other.x);
+        let end = self.pixel_end().max(other.pixel_end());
+        *self = Self::new(x, end.saturating_sub(x));
+    }
+
+    /// Returns the intersection of this span with another span.
+    pub fn intersect(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let end = self.pixel_end().min(other.pixel_end());
+        (x < end).then(|| Self::new(x, end - x))
+    }
+
+    /// Returns the horizontal start position in pixels.
+    pub fn pixel_x(self) -> u16 {
+        self.x
+    }
+
+    /// Returns the horizontal span width in pixels.
+    pub fn pixel_width(self) -> u16 {
+        self.width
+    }
+
+    /// Returns the exclusive horizontal end position in pixels.
+    pub fn pixel_end(self) -> u16 {
+        self.pixel_x().saturating_add(self.pixel_width())
     }
 }

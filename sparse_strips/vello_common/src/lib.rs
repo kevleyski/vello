@@ -1,9 +1,12 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+// After you edit the crate's doc comment, run this command, then check README.md for any missing links
+// cargo rdme --workspace-project=vello_common
+
 //! This crate includes common geometry representations, tiling logic, and other fundamental components used by both [Vello CPU][vello_cpu] and Vello Hybrid.
 //!
-//! ## Usage
+//! # Usage
 //!
 //! This crate should not be used on its own, and you should instead use one of the renderers which use it.
 //! At the moment, only [Vello CPU][vello_cpu] is published, and you probably want to use that.
@@ -12,20 +15,18 @@
 //! Vello CPU is being developed as part of work to address shortcomings in Vello.
 //! Vello does not use this crate.
 //!
-//! ## Features
+//! # Features
 //!
 //! - `std` (enabled by default): Get floating point functions from the standard library
 //!   (likely using your target's libc).
-//! - `libm`: Use floating point implementations from [libm].
+//! - `libm`: Use floating point implementations from [libm][].
 //! - `png` (enabled by default): Allow loading [`Pixmap`][crate::pixmap::Pixmap]s from PNG images.
 //!   Also required for rendering glyphs with an embedded PNG.
 //!   Implies `std`.
-//! - `simd`: Allows requesting SIMD execution modes.
-//!   Note that SIMD is not yet implemented.
 //!
 //! At least one of `std` and `libm` is required; `std` overrides `libm`.
 //!
-//! ## Contents
+//! # Contents
 //!
 //! - Shared data structures for paths, tiles, and strips
 //! - Geometry processing utilities
@@ -34,7 +35,8 @@
 //! This crate acts as a foundation for `vello_cpu` and `vello_hybrid`, providing essential components to minimize duplication.
 //!
 //! [vello_cpu]: https://crates.io/crates/vello_cpu
-
+#![cfg_attr(feature = "libm", doc = "[libm]: libm")]
+#![cfg_attr(not(feature = "libm"), doc = "[libm]: https://crates.io/crates/libm")]
 // LINEBENDER LINT SET - lib.rs - v3
 // See https://linebender.org/wiki/canonical-lints/
 // These lints shouldn't apply to examples or tests.
@@ -62,22 +64,29 @@ extern crate alloc;
 extern crate std;
 
 pub mod blurred_rounded_rect;
+pub mod clip;
 pub mod coarse;
-#[cfg(feature = "text")]
-pub mod colr;
 pub mod encode;
+pub mod filter;
+pub mod filter_effects;
 pub mod flatten;
 pub(crate) mod flatten_simd;
-#[cfg(feature = "text")]
-pub mod glyph;
+pub mod geometry;
+pub mod image_cache;
 pub mod mask;
 pub mod math;
+pub mod multi_atlas;
 pub mod paint;
 #[doc(hidden)]
 #[cfg(feature = "pico_svg")]
 pub mod pico_svg;
 pub mod pixmap;
-pub mod recording;
+#[doc(hidden)]
+#[cfg(feature = "probe")]
+pub mod probe;
+pub mod rect;
+pub mod render_graph;
+pub mod render_state;
 pub mod simd;
 pub mod strip;
 pub mod strip_generator;
@@ -88,3 +97,10 @@ pub use fearless_simd;
 pub use peniko;
 pub use peniko::color;
 pub use peniko::kurbo;
+
+/// A handle to an external, user-provided texture.
+///
+/// This is resolved at render time by passing in a mapping of handles to textures, but is
+/// otherwise opaque to the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextureId(pub u64);

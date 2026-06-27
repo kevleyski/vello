@@ -196,6 +196,7 @@ fn coarse_main(
     let width_in_bins = width_in_tiles.div_ceil(N_TILE_X as u32);
     let height_in_bins = height_in_tiles.div_ceil(N_TILE_Y as u32);
     let n_bins = width_in_bins * height_in_bins;
+    let aligned_n_bins = (n_bins + 255) & !255;
     let bin_data_start = config.layout.bin_data_start;
     let drawtag_base = config.layout.draw_tag_base;
     let mut compacted = vec![vec![]; N_TILE];
@@ -209,7 +210,7 @@ fn coarse_main(
         let bin_tile_x = N_TILE_X as u32 * bin_x;
         let bin_tile_y = N_TILE_Y as u32 * bin_y;
         for part in 0..n_partitions {
-            let in_ix = part * N_TILE as u32 + bin;
+            let in_ix = part * aligned_n_bins + bin;
             let bin_header = bin_headers[in_ix as usize];
             let start = bin_data_start + bin_header.chunk_offset;
             for i in 0..bin_header.element_count {
@@ -334,7 +335,13 @@ fn coarse_main(
                                 tile_state.write_blur_rect(config, bump, ptcl, rgba_color, di + 1);
                             }
                             DrawTag::BEGIN_CLIP => {
-                                if tile.segment_count_or_ix == 0 && tile.backdrop == 0 {
+                                let even_odd = (draw_flags & DRAW_INFO_FLAGS_FILL_RULE_BIT) != 0;
+                                let backdrop_clear = if even_odd {
+                                    tile.backdrop.abs() & 1 == 0
+                                } else {
+                                    tile.backdrop == 0
+                                };
+                                if tile.segment_count_or_ix == 0 && backdrop_clear {
                                     clip_zero_depth = clip_depth + 1;
                                 } else {
                                     tile_state.write_begin_clip(config, bump, ptcl);
@@ -347,8 +354,7 @@ fn coarse_main(
                             }
                             DrawTag::END_CLIP => {
                                 clip_depth -= 1;
-                                // A clip shape is always a non-zero fill (draw_flags=0).
-                                tile_state.write_path(config, bump, ptcl, tile, 0);
+                                tile_state.write_path(config, bump, ptcl, tile, draw_flags);
                                 let blend = scene[dd as usize];
                                 let alpha = f32::from_bits(scene[dd as usize + 1]);
                                 tile_state.write_end_clip(config, bump, ptcl, blend, alpha);

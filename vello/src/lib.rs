@@ -97,7 +97,6 @@
     missing_debug_implementations,
     clippy::cast_possible_truncation,
     clippy::missing_assert_message,
-    clippy::shadow_unrelated,
     reason = "Deferred"
 )]
 #![allow(
@@ -144,7 +143,7 @@ use peniko::ImageData;
 pub use wgpu;
 
 pub use scene::{DrawGlyphs, Scene};
-pub use vello_encoding::{Glyph, NormalizedCoord};
+pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord};
 
 use low_level::ShaderId;
 #[cfg(feature = "wgpu")]
@@ -331,6 +330,7 @@ pub struct Renderer {
     options: RendererOptions,
     engine: WgpuEngine,
     resolver: Resolver,
+    image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
@@ -446,6 +446,7 @@ impl Renderer {
             options,
             engine,
             resolver: Resolver::new(),
+            image_atlas: None,
             shaders,
             #[cfg(feature = "debug_layers")]
             debug,
@@ -478,8 +479,13 @@ impl Renderer {
         texture: &TextureView,
         params: &RenderParams,
     ) -> Result<()> {
-        let (recording, target) =
-            render::render_full(scene, &mut self.resolver, &self.shaders, params);
+        let (recording, target) = render::render_full(
+            scene,
+            &mut self.resolver,
+            &self.shaders,
+            &mut self.image_atlas,
+            params,
+        );
         let external_resources = [ExternalResource::Image(
             *target.as_image().unwrap(),
             texture,
@@ -532,10 +538,20 @@ impl Renderer {
         image: &ImageData,
         texture: Option<wgpu::TexelCopyTextureInfoBase<wgpu::Texture>>,
     ) -> Option<wgpu::TexelCopyTextureInfoBase<wgpu::Texture>> {
+        self.resolver.mark_image_dirty(image);
         match texture {
             Some(texture) => self.engine.image_overrides.insert(image.data.id(), texture),
             None => self.engine.image_overrides.remove(&image.data.id()),
         }
+    }
+
+    /// Marks `image` as dirty in the atlas cache, so its override texture will be recopied on
+    /// the next render that uses it.
+    ///
+    /// Call this for any `image` whose existing override texture has changed since the last render.
+    /// Otherwise, stale image data from the atlas may be used.
+    pub fn mark_override_image_dirty(&mut self, image: &ImageData) {
+        self.resolver.mark_image_dirty(image);
     }
 
     /// Register a [`wgpu::Texture`] with Vello, to allow drawing GPU-resident data.
@@ -575,34 +591,33 @@ impl Renderer {
             aspect: wgpu::TextureAspect::All,
         };
 
-        // We overwrite any attempt to use the fake blob, instead reading from the texture
-        self.engine
-            .image_overrides
-            .insert(image.data.id(), texture_base);
+        // We overwrite any attempt to use the fake blob, instead reading from the texture.
+        self.override_image(&image, Some(texture_base));
 
         image
     }
 
     /// Unregister a [`wgpu::Texture`] that was registered with [`register_texture`](Self::register_texture).
     pub fn unregister_texture(&mut self, handle: ImageData) {
-        self.engine.image_overrides.remove(&handle.data.id());
+        self.override_image(&handle, None);
     }
 
     /// Reload the shaders. This should only be used during `vello` development
     #[cfg(feature = "hot_reload")]
     #[doc(hidden)] // End-users of Vello should not have `hot_reload` enabled.
     pub async fn reload_shaders(&mut self, device: &Device) -> Result<(), Error> {
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut engine = WgpuEngine::new(self.options.use_cpu, self.options.pipeline_cache.clone());
         // We choose not to initialise these shaders in parallel, to ensure the error scope works correctly
         let shaders = shaders::full_shaders(device, &mut engine, &self.options)?;
         #[cfg(feature = "debug_layers")]
         let debug = debug::DebugRenderer::new(device, wgpu::TextureFormat::Rgba8Unorm, &mut engine);
-        let error = device.pop_error_scope().await;
+        let error = scope.pop().await;
         if let Some(error) = error {
             return Err(error.into());
         }
         self.engine = engine;
+        self.image_atlas = None;
         self.shaders = shaders;
         #[cfg(feature = "debug_layers")]
         {
@@ -717,6 +732,7 @@ impl Renderer {
             encoding,
             &mut self.resolver,
             &self.shaders,
+            &mut self.image_atlas,
             params,
             robust,
         );

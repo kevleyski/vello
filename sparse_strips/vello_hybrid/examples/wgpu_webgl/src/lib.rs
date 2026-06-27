@@ -20,21 +20,33 @@ use vello_example_scenes::{AnyScene, image::ImageScene};
 use vello_hybrid::{AtlasConfig, Pixmap, RenderSettings, RenderTargetConfig, Renderer, Scene};
 use wasm_bindgen::prelude::*;
 use web_sys::{Event, HtmlCanvasElement, KeyboardEvent, MouseEvent, WheelEvent};
+use wgpu::{
+    CurrentSurfaceTexture,
+    rwh::{DisplayHandle, HandleError, HasDisplayHandle},
+};
+
+#[derive(Debug)]
+struct OurDisplayHandle;
+impl HasDisplayHandle for OurDisplayHandle {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        Ok(DisplayHandle::web())
+    }
+}
 
 struct RendererWrapper {
-    renderer: vello_hybrid::Renderer,
+    renderer: Renderer,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
 }
 
 impl RendererWrapper {
-    async fn new(canvas: web_sys::HtmlCanvasElement) -> Self {
+    async fn new(canvas: HtmlCanvasElement) -> Self {
         let width = canvas.width();
         let height = canvas.height();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::GL,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(OurDisplayHandle))
         });
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
@@ -85,11 +97,12 @@ impl RendererWrapper {
                 height,
             },
             RenderSettings {
-                level: Level::try_detect().unwrap_or(Level::fallback()),
+                level: Level::try_detect().unwrap_or(Level::baseline()),
                 atlas_config: AtlasConfig {
                     atlas_size: (max_texture_dimension_2d, max_texture_dimension_2d),
                     ..AtlasConfig::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -119,8 +132,9 @@ impl RendererWrapper {
 /// State that handles scene rendering and interactions
 struct AppState {
     scenes: Box<[AnyScene<Scene>]>,
+    uploaded_scene_images: Box<[bool]>,
     current_scene: usize,
-    scene: vello_hybrid::Scene,
+    scene: Scene,
     transform: Affine,
     mouse_down: bool,
     last_cursor_position: Option<Point>,
@@ -135,13 +149,15 @@ impl AppState {
     async fn new(canvas: HtmlCanvasElement, scenes: Box<[AnyScene<Scene>]>) -> Self {
         let width = canvas.width();
         let height = canvas.height();
+        let uploaded_scene_images = vec![false; scenes.len()].into_boxed_slice();
 
         let renderer_wrapper = RendererWrapper::new(canvas.clone()).await;
 
         let mut app_state = Self {
             scenes,
+            uploaded_scene_images,
             current_scene: 0,
-            scene: vello_hybrid::Scene::new(width as u16, height as u16),
+            scene: Scene::new(width as u16, height as u16),
             transform: Affine::IDENTITY,
             mouse_down: false,
             last_cursor_position: None,
@@ -173,7 +189,19 @@ impl AppState {
             height: self.height,
         };
 
-        let surface_texture = self.renderer_wrapper.surface.get_current_texture().unwrap();
+        let surface_texture = match self.renderer_wrapper.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
+            CurrentSurfaceTexture::Occluded
+            | CurrentSurfaceTexture::Timeout
+            | CurrentSurfaceTexture::Outdated
+            | CurrentSurfaceTexture::Suboptimal(_) => {
+                return;
+            }
+            CurrentSurfaceTexture::Lost => panic!("Surface was lost"),
+            CurrentSurfaceTexture::Validation => {
+                panic!("Validation error getting surface")
+            }
+        };
         let surface_texture_view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -187,11 +215,13 @@ impl AppState {
             .renderer
             .render(
                 &self.scene,
+                self.scenes[self.current_scene].resources_mut(),
                 &self.renderer_wrapper.device,
                 &self.renderer_wrapper.queue,
                 &mut encoder,
                 &render_size,
                 &surface_texture_view,
+                &vello_hybrid::TextureBindings::new(),
             )
             .unwrap();
 
@@ -207,7 +237,7 @@ impl AppState {
         self.width = width;
         self.height = height;
 
-        self.scene = vello_hybrid::Scene::new(width as u16, height as u16);
+        self.scene = Scene::new(width as u16, height as u16);
         self.renderer_wrapper.resize(width, height);
 
         self.need_render = true;
@@ -215,6 +245,7 @@ impl AppState {
 
     fn next_scene(&mut self) {
         self.current_scene = (self.current_scene + 1) % self.scenes.len();
+        self.upload_images_to_atlas();
         self.transform = Affine::IDENTITY;
         self.need_render = true;
     }
@@ -225,6 +256,7 @@ impl AppState {
         } else {
             self.current_scene - 1
         };
+        self.upload_images_to_atlas();
         self.transform = Affine::IDENTITY;
         self.need_render = true;
     }
@@ -232,6 +264,14 @@ impl AppState {
     fn reset_transform(&mut self) {
         self.transform = Affine::IDENTITY;
         self.need_render = true;
+    }
+
+    fn handle_key(&mut self, key: &str) {
+        if let Some(scene) = self.scenes.get_mut(self.current_scene)
+            && scene.handle_key(key)
+        {
+            self.need_render = true;
+        }
     }
 
     fn handle_mouse_down(&mut self, x: f64, y: f64) {
@@ -274,6 +314,10 @@ impl AppState {
     }
 
     fn upload_images_to_atlas(&mut self) {
+        if self.uploaded_scene_images[self.current_scene] {
+            return;
+        }
+
         let mut encoder =
             self.renderer_wrapper
                 .device
@@ -284,6 +328,7 @@ impl AppState {
         // 1st example — uploading pixmap directly to WebGL atlas
         let pixmap1 = ImageScene::read_flower_image();
         self.renderer_wrapper.renderer.upload_image(
+            self.scenes[self.current_scene].resources_mut(),
             &self.renderer_wrapper.device,
             &self.renderer_wrapper.queue,
             &mut encoder,
@@ -298,6 +343,7 @@ impl AppState {
             &pixmap2,
         );
         self.renderer_wrapper.renderer.upload_image(
+            self.scenes[self.current_scene].resources_mut(),
             &self.renderer_wrapper.device,
             &self.renderer_wrapper.queue,
             &mut encoder,
@@ -305,6 +351,7 @@ impl AppState {
         );
 
         self.renderer_wrapper.queue.submit([encoder.finish()]);
+        self.uploaded_scene_images[self.current_scene] = true;
     }
 
     fn upload_image_to_texture(
@@ -371,7 +418,7 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         .unwrap()
         .create_element("canvas")
         .unwrap()
-        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .dyn_into::<HtmlCanvasElement>()
         .unwrap();
     canvas.set_width(canvas_width as u32);
     canvas.set_height(canvas_height as u32);
@@ -395,10 +442,13 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         .append_child(&canvas)
         .unwrap();
 
-    let scenes = vello_example_scenes::get_example_scenes(vec![
-        ImageSource::OpaqueId(ImageId::new(0)),
-        ImageSource::OpaqueId(ImageId::new(1)),
-    ]);
+    let scenes = vello_example_scenes::get_example_scenes(
+        vello_example_scenes::Capabilities::default(),
+        vec![
+            ImageSource::opaque_id(ImageId::new(0)),
+            ImageSource::opaque_id(ImageId::new(1)),
+        ],
+    );
 
     let app_state = Rc::new(RefCell::new(AppState::new(canvas.clone(), scenes).await));
 
@@ -496,15 +546,15 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     {
         let app_state = app_state.clone();
         let document = web_sys::window().unwrap().document().unwrap();
-        let closure =
-            Closure::wrap(
-                Box::new(move |event: KeyboardEvent| match event.key().as_str() {
-                    "ArrowRight" => app_state.borrow_mut().next_scene(),
-                    "ArrowLeft" => app_state.borrow_mut().prev_scene(),
-                    " " => app_state.borrow_mut().reset_transform(),
-                    _ => {}
-                }) as Box<dyn FnMut(_)>,
-            );
+        let closure = Closure::wrap(Box::new(move |event: KeyboardEvent| {
+            let key = event.key();
+            match key.as_str() {
+                "ArrowRight" => app_state.borrow_mut().next_scene(),
+                "ArrowLeft" => app_state.borrow_mut().prev_scene(),
+                " " => app_state.borrow_mut().reset_transform(),
+                _ => app_state.borrow_mut().handle_key(key.as_str()),
+            }
+        }) as Box<dyn FnMut(_)>);
         document
             .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
             .unwrap();
@@ -541,12 +591,12 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
 }
 
 /// Creates a `HTMLCanvasElement` and renders a single scene into it
-pub async fn render_scene(scene: vello_hybrid::Scene, width: u16, height: u16) {
+pub async fn render_scene(scene: Scene, width: u16, height: u16) {
     let canvas = web_sys::Window::document(&web_sys::window().unwrap())
         .unwrap()
         .create_element("canvas")
         .unwrap()
-        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .dyn_into::<HtmlCanvasElement>()
         .unwrap();
     canvas.set_width(width as u32);
     canvas.set_height(height as u32);
@@ -572,22 +622,28 @@ pub async fn render_scene(scene: vello_hybrid::Scene, width: u16, height: u16) {
         width: width as u32,
         height: height as u32,
     };
-    let surface_texture = surface.get_current_texture().unwrap();
+    let surface_texture = match surface.get_current_texture() {
+        CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
+        e => panic!("Error getting initial surface: {e:?}"),
+    };
     let surface_texture_view = surface_texture
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
 
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let mut resources = vello_hybrid::Resources::new();
 
     renderer
         .render(
             &scene,
+            &mut resources,
             &device,
             &queue,
             &mut encoder,
             &render_size,
             &surface_texture_view,
+            &vello_hybrid::TextureBindings::new(),
         )
         .unwrap();
 

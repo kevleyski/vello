@@ -100,6 +100,14 @@ fn snapshot_many_clips() {
 
 #[test]
 #[cfg_attr(skip_gpu_tests, ignore)]
+fn snapshot_clip_test() {
+    let test_scene = test_scenes::clip_test();
+    let params = TestParams::new("clip_test", 512, 768);
+    snapshot_test_scene(test_scene, params);
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
 fn snapshot_blurred_rounded_rect() {
     let test_scene = test_scenes::blurred_rounded_rect();
     let params = TestParams::new("blurred_rounded_rect", 400, 400);
@@ -119,6 +127,14 @@ fn snapshot_longpathdash_butt() {
 fn snapshot_image_sampling() {
     let test_scene = test_scenes::image_sampling();
     let params = TestParams::new("image_sampling", 400, 400);
+    snapshot_test_scene(test_scene, params);
+}
+
+#[test]
+#[cfg_attr(skip_gpu_tests, ignore)]
+fn snapshot_image_sampling_bicubic() {
+    let test_scene = test_scenes::image_sampling_bicubic();
+    let params = TestParams::new("image_sampling_bicubic", 520, 336);
     snapshot_test_scene(test_scene, params);
 }
 

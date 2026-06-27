@@ -179,6 +179,8 @@ fn main(
     }
     let width_in_bins = (config.width_in_tiles + N_TILE_X - 1u) / N_TILE_X;
     let bin_ix = width_in_bins * wg_id.y + wg_id.x;
+    let height_in_bins = (config.height_in_tiles + N_TILE_Y - 1u) / N_TILE_Y;
+    let aligned_n_bins = (width_in_bins * height_in_bins + N_TILE - 1u) & ~(N_TILE - 1u);
     let n_partitions = (config.n_drawobj + N_TILE - 1u) / N_TILE;
 
     // Coordinates of the top left of this bin, in tiles.
@@ -218,7 +220,7 @@ fn main(
                 part_start_ix = ready_ix;
                 var count = 0u;
                 if partition_ix + local_id.x < n_partitions {
-                    let in_ix = (partition_ix + local_id.x) * N_TILE + bin_ix;
+                    let in_ix = (partition_ix + local_id.x) * aligned_n_bins + bin_ix;
                     let bin_header = bin_headers[in_ix];
                     count = bin_header.element_count;
                     sh_part_offsets[local_id.x] = bin_header.chunk_offset;
@@ -410,7 +412,9 @@ fn main(
                         write_image(di + 1u);
                     }
                     case DRAWTAG_BEGIN_CLIP: {
-                        if tile.segment_count_or_ix == 0u && tile.backdrop == 0 {
+                        let even_odd = (draw_flags & DRAW_INFO_FLAGS_FILL_RULE_BIT) != 0u;
+                        let backdrop_clear = select(tile.backdrop, abs(tile.backdrop) & 1, even_odd) == 0;
+                        if tile.segment_count_or_ix == 0u && backdrop_clear {
                             clip_zero_depth = clip_depth + 1u;
                         } else {
                             write_begin_clip();
@@ -421,8 +425,7 @@ fn main(
                     }
                     case DRAWTAG_END_CLIP: {
                         clip_depth -= 1u;
-                        // A clip shape is always a non-zero fill (draw_flags=0).
-                        write_path(tile, tile_ix, /*draw_flags=*/0u);
+                        write_path(tile, tile_ix, draw_flags);
                         let blend = scene[dd];
                         let alpha = bitcast<f32>(scene[dd + 1u]);
                         write_end_clip(CmdEndClip(blend, alpha));

@@ -4,7 +4,7 @@
 //! Tests for clipping.
 
 use crate::renderer::Renderer;
-use crate::util::{circular_star, crossed_line_star};
+use crate::util::{circular_star, crossed_line_star, stops_green_blue};
 use std::f64::consts::PI;
 use vello_common::coarse::WideTile;
 use vello_common::color::palette::css::{
@@ -14,6 +14,9 @@ use vello_common::kurbo::{Affine, BezPath, Circle, Point, Rect, Shape, Stroke};
 use vello_common::peniko::Color;
 use vello_common::peniko::Fill;
 use vello_common::tile::Tile;
+use vello_cpu::peniko::{
+    Gradient, LinearGradientPosition, RadialGradientPosition, SweepGradientPosition,
+};
 use vello_dev_macros::vello_test;
 
 #[vello_test(height = 8)]
@@ -162,6 +165,53 @@ fn clip_rectangle_and_circle(ctx: &mut impl Renderer) {
     ctx.fill_rect(&large_rect);
     ctx.pop_layer();
     ctx.pop_layer();
+}
+
+#[vello_test(width = 100, height = 60)]
+fn clip_rect_cull_alignment(ctx: &mut impl Renderer) {
+    const {
+        assert!(
+            Tile::HEIGHT >= 4 && Tile::HEIGHT <= 16,
+            "This test only shows regressions if the tile height remains between 4 and 16 inclusive"
+        );
+    }
+
+    // A strip-aligned Y value.
+    const TOP_Y: f64 = Tile::HEIGHT as f64;
+
+    // Another strip-aligned Y value lower down.
+    // FIXME: make const once MSRV >= 1.90
+    let bot_y: f64 = (46. / Tile::HEIGHT as f64).ceil() * Tile::HEIGHT as f64;
+
+    let clip_rect = Rect::new(18.0, TOP_Y + 2., 78.0, bot_y - 2.);
+    ctx.set_paint(DARK_GREEN.with_alpha(0.1));
+    ctx.fill_rect(&clip_rect);
+
+    // Draw a near-rectangle with slightly curved top and bottom edges to hit interesting
+    // flattening paths.
+    //
+    // The shape's top segment is outside and above the clip path, so it may end up being culled.
+    // However, the shape does not extend above the strip *row*, so the vertical segments of the
+    // shape that connect to the horizontal segment do not contribute coarse winding. Therefore,
+    // the horizontal segment cannot be ignored, as winding between the two vertical segments in
+    // its strip row needs to be correctly accounted.
+    //
+    // The same holds for the bottom segment, except that that case is simpler in our pipeline:
+    // coarse winding is accounted when geometry of the path passes the strip's top edge, which
+    // means this strip row will either get a sparse fill, or will get dense tiles due to other
+    // unculled geometry existing.
+    let mut path = BezPath::new();
+    let top_y = TOP_Y + 1.;
+    let bot_y = bot_y - 1.;
+    path.move_to((30.0, bot_y));
+    path.line_to((30.0, top_y));
+    path.curve_to((45.0, top_y - 0.5), (55.0, top_y - 0.5), (70.0, top_y));
+    path.line_to((70.0, bot_y));
+    path.curve_to((55.0, bot_y + 0.5), (45.0, bot_y + 0.5), (30.0, bot_y));
+    ctx.push_clip_path(&clip_rect.to_path(0.1));
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_path(&path);
+    ctx.pop_clip_path();
 }
 
 #[vello_test]
@@ -324,5 +374,229 @@ fn clip_exceeding_viewport(ctx: &mut impl Renderer) {
 #[vello_test(no_ref)]
 fn clip_completely_in_out_of_bounds_wide_tile(ctx: &mut impl Renderer) {
     ctx.push_clip_layer(&Rect::new(300.0, 8.0, 350.0, 48.0).to_path(0.1));
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 16, height = 16)]
+fn clip_non_isolated_outside_canvas(ctx: &mut impl Renderer) {
+    // Should be completely clipped.
+    let clip_rect = Rect::new(0.0, 0.0, 16.0, 16.0);
+    ctx.push_clip_path(&clip_rect.to_path(0.1));
+
+    let rect = Rect::new(16.0, -16.0, 32.0, 0.0);
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_rect(&rect);
+    ctx.pop_clip_path();
+}
+
+#[vello_test]
+fn clip_non_isolated_with_rect(ctx: &mut impl Renderer) {
+    let clip_rect = Rect::new(10.0, 10.0, 90.0, 90.0);
+    ctx.push_clip_path(&clip_rect.to_path(0.1));
+
+    ctx.set_paint(BLUE);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+    ctx.pop_clip_path();
+}
+
+#[vello_test]
+fn clip_non_isolated_with_rotated_rect(ctx: &mut impl Renderer) {
+    let clip_rect = Rect::new(10.0, 10.0, 90.0, 90.0);
+    ctx.push_clip_path(&clip_rect.to_path(0.1));
+
+    ctx.set_transform(Affine::rotate_about(
+        25.0 * PI / 180.0,
+        Point::new(50.0, 50.0),
+    ));
+    ctx.set_paint(BLUE);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+    ctx.pop_clip_path();
+}
+
+#[vello_test]
+fn clip_non_isolated_with_scaled_rect(ctx: &mut impl Renderer) {
+    let clip_rect = Rect::new(10.0, 10.0, 90.0, 90.0);
+    ctx.push_clip_path(&clip_rect.to_path(0.1));
+
+    ctx.set_transform(
+        Affine::translate((50.0, 50.0)) * Affine::scale(4.0) * Affine::translate((-50.0, -50.0)),
+    );
+    ctx.set_paint(BLUE);
+    ctx.fill_rect(&Rect::new(40.0, 40.0, 60.0, 60.0));
+    ctx.pop_clip_path();
+}
+
+#[vello_test]
+fn clip_non_isolated_with_aa_with_rect(ctx: &mut impl Renderer) {
+    let clip_rect = Rect::new(10.5, 10.5, 89.5, 89.5);
+    ctx.push_clip_path(&clip_rect.to_path(0.1));
+
+    ctx.set_paint(BLUE);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 100.0, 100.0));
+    ctx.pop_clip_path();
+}
+
+#[vello_test]
+fn clip_non_isolated_with_aa_with_rect_aa(ctx: &mut impl Renderer) {
+    // In theory, anti-aliasing should be 50% here, but due to conflation artifacts it will be
+    // 25% instead.
+    let rect = Rect::new(10.5, 10.5, 89.5, 89.5);
+    ctx.push_clip_path(&rect.to_path(0.1));
+
+    ctx.set_paint(BLUE);
+    ctx.fill_rect(&rect);
+    ctx.pop_clip_path();
+}
+
+#[vello_test]
+fn clip_non_isolated_rectangle_with_star_evenodd(ctx: &mut impl Renderer) {
+    let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+    let star_path = crossed_line_star();
+
+    ctx.set_fill_rule(Fill::EvenOdd);
+    ctx.push_clip_path(&star_path);
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_rect(&rect);
+    ctx.pop_clip_path();
+}
+
+#[vello_test(cpu_u8_tolerance = 1)]
+fn clip_non_isolated_deeply_nested_circles(ctx: &mut impl Renderer) {
+    const INITIAL_RADIUS: f64 = 48.0;
+    const RADIUS_DECREMENT: f64 = 2.5;
+    const INNER_COUNT: usize = 10;
+    // `.ceil()` is not constant-evaluatable, so we have to do this at runtime.
+    let outer_count: usize =
+        (INITIAL_RADIUS / RADIUS_DECREMENT / INNER_COUNT as f64).ceil() as usize;
+    const COLORS: [Color; INNER_COUNT] = [
+        RED,
+        DARK_BLUE,
+        DARK_GREEN,
+        REBECCA_PURPLE,
+        BLACK,
+        BLUE,
+        GREEN,
+        RED,
+        DARK_BLUE,
+        DARK_GREEN,
+    ];
+
+    const COVER_RECT: Rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+    const CENTER: Point = Point::new(50.0, 50.0);
+    let mut radius = INITIAL_RADIUS;
+
+    for _ in 0..outer_count {
+        for color in COLORS.iter() {
+            let clip_circle = Circle::new(CENTER, radius).to_path(0.1);
+            draw_clipping_outline(ctx, &clip_circle);
+            ctx.push_clip_path(&clip_circle);
+
+            ctx.set_paint(*color);
+            ctx.fill_rect(&COVER_RECT);
+
+            radius -= RADIUS_DECREMENT;
+        }
+    }
+    for _ in 0..outer_count {
+        for _ in COLORS.iter() {
+            ctx.pop_clip_path();
+        }
+    }
+}
+
+#[vello_test(width = 600, height = 200)]
+fn clip_with_linear_gradient_fill(ctx: &mut impl Renderer) {
+    // Border to see crop.
+    ctx.fill_rect(&Rect::new(0., 0., 600., 200.));
+
+    // Crop 10px border around image.
+    let clip = Rect::new(10., 10., 590., 190.0);
+    ctx.push_clip_layer(&clip.to_path(0.));
+
+    // Fill a full screen rect with a gradient.
+    let box_rect = Rect::new(0., 0., 600.0, 200.0);
+
+    let gradient = Gradient {
+        kind: LinearGradientPosition {
+            start: Point::new(100.0, 100.0),
+            end: Point::new(300.0, 100.0),
+        }
+        .into(),
+        stops: stops_green_blue(),
+        ..Default::default()
+    };
+
+    ctx.set_paint(gradient);
+    ctx.fill_rect(&box_rect);
+
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 600, height = 200)]
+fn clip_with_radial_gradient_fill(ctx: &mut impl Renderer) {
+    // Border to see crop.
+    ctx.fill_rect(&Rect::new(0., 0., 600., 200.));
+
+    // Crop 10px border around image.
+    let clip = Rect::new(10., 10., 590., 190.0);
+    ctx.push_clip_layer(&clip.to_path(0.));
+
+    // Fill a full screen rect with a gradient.
+    let box_rect = Rect::new(0., 0., 600.0, 200.0);
+
+    let gradient = Gradient {
+        kind: RadialGradientPosition {
+            start_center: Point::new(300.0, 100.0),
+            start_radius: 0.0,
+            end_center: Point::new(300.0, 100.0),
+            end_radius: 150.0,
+        }
+        .into(),
+        stops: stops_green_blue(),
+        ..Default::default()
+    };
+
+    ctx.set_paint(gradient);
+    ctx.fill_rect(&box_rect);
+
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 600, height = 200)]
+fn clip_with_sweep_gradient_fill(ctx: &mut impl Renderer) {
+    // Border to see crop.
+    ctx.fill_rect(&Rect::new(0., 0., 600., 200.));
+
+    // Crop 10px border around image.
+    let clip = Rect::new(10., 10., 590., 190.0);
+    ctx.push_clip_layer(&clip.to_path(0.));
+
+    // Fill a full screen rect with a gradient.
+    let box_rect = Rect::new(0., 0., 600.0, 200.0);
+
+    let gradient = Gradient {
+        kind: SweepGradientPosition {
+            center: Point::new(300.0, 100.0),
+            start_angle: 0.0,
+            end_angle: std::f32::consts::TAU,
+        }
+        .into(),
+        stops: stops_green_blue(),
+        ..Default::default()
+    };
+
+    ctx.set_paint(gradient);
+    ctx.fill_rect(&box_rect);
+
+    ctx.pop_layer();
+}
+
+#[vello_test(width = 300, height = 30, skip_hybrid)]
+fn clip_layer_encloses_viewport_via_left_cull(ctx: &mut impl Renderer) {
+    let clip = Rect::new(-100.0, -100.0, 400.0, 130.0).to_path(0.1);
+
+    ctx.push_clip_layer(&clip);
+    ctx.set_paint(REBECCA_PURPLE);
+    ctx.fill_rect(&Rect::new(0.0, 0.0, 300.0, 30.0));
     ctx.pop_layer();
 }

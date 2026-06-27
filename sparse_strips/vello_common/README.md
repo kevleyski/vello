@@ -16,7 +16,7 @@
 
 <!-- We use cargo-rdme to update the README with the contents of lib.rs.
 To edit the following section, update it in lib.rs, then run:
-cargo rdme --workspace-project=vello_common --heading-base-level=0
+cargo rdme --workspace-project=vello_common
 Full documentation at https://github.com/orium/cargo-rdme -->
 
 <!-- Intra-doc links used in lib.rs should be evaluated here.
@@ -24,7 +24,6 @@ See https://linebender.org/blog/doc-include/ for related discussion. -->
 
 [libm]: https://crates.io/crates/libm
 [crate::pixmap::Pixmap]: https://docs.rs/vello_common/latest/vello_common/pixmap/struct.Pixmap.html
-
 <!-- cargo-rdme start -->
 
 This crate includes common geometry representations, tiling logic, and other fundamental components used by both [Vello CPU][vello_cpu] and Vello Hybrid.
@@ -42,12 +41,10 @@ Vello does not use this crate.
 
 - `std` (enabled by default): Get floating point functions from the standard library
   (likely using your target's libc).
-- `libm`: Use floating point implementations from [libm].
+- `libm`: Use floating point implementations from [libm][].
 - `png` (enabled by default): Allow loading [`Pixmap`][crate::pixmap::Pixmap]s from PNG images.
   Also required for rendering glyphs with an embedded PNG.
   Implies `std`.
-- `simd`: Allows requesting SIMD execution modes.
-  Note that SIMD is not yet implemented.
 
 At least one of `std` and `libm` is required; `std` overrides `libm`.
 

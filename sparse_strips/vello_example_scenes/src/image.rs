@@ -3,6 +3,7 @@
 
 //! Image rendering example scene.
 use std::f64::consts::PI;
+use std::io::Cursor;
 
 use vello_common::color::PremulRgba8;
 use vello_common::kurbo::{BezPath, Point, Shape, Vec2};
@@ -31,7 +32,12 @@ impl ImageScene {
 }
 
 impl ExampleScene for ImageScene {
-    fn render(&mut self, ctx: &mut impl RenderingContext, root_transform: Affine) {
+    fn render<T: RenderingContext>(
+        &mut self,
+        ctx: &mut T,
+        _resources: &mut T::Resources,
+        root_transform: Affine,
+    ) {
         let splash_flower_id = self.img_sources[0].clone();
         let cowboy_id = self.img_sources[1].clone();
 
@@ -204,7 +210,7 @@ impl ImageScene {
     /// Read the cowboy image
     pub fn read_cowboy_image() -> Pixmap {
         let data = include_bytes!("../../vello_sparse_tests/tests/assets/cowboy.png");
-        Pixmap::from_png(&data[..]).unwrap()
+        Pixmap::from_png(Cursor::new(data)).unwrap()
     }
 }
 
@@ -250,7 +256,7 @@ fn circular_star(center: Point, n: usize, inner: f64, outer: f64) -> BezPath {
     let start_angle = -std::f64::consts::FRAC_PI_2;
     path.move_to(center + outer * Vec2::from_angle(start_angle));
     for i in 1..n * 2 {
-        let th = start_angle + i as f64 * std::f64::consts::PI / n as f64;
+        let th = start_angle + i as f64 * PI / n as f64;
         let r = if i % 2 == 0 { outer } else { inner };
         path.line_to(center + r * Vec2::from_angle(th));
     }
